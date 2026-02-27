@@ -1,0 +1,245 @@
+# ==============================================================================
+# GESTOR DE INFRAESTRUCTURA - VERSIÓN PARA WINDOWS SERVER 2022
+# ==============================================================================
+
+# Obtener la ruta del script
+$SCRIPT_DIR = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# =========================
+# CARGAR MÓDULOS
+# =========================
+
+Write-Host "Cargando módulos desde: $SCRIPT_DIR" -ForegroundColor Cyan
+
+# Funciones Compartidas
+if (Test-Path "$SCRIPT_DIR\funciones_compartidas.ps1") {
+    . "$SCRIPT_DIR\funciones_compartidas.ps1"
+    Write-Host "✓ Módulo funciones_compartidas.ps1 cargado" -ForegroundColor Green
+} else {
+    Write-Host "✗ Error: No se encuentra funciones_compartidas.ps1" -ForegroundColor Red
+    exit 1
+}
+
+# Funciones DHCP
+if (Test-Path "$SCRIPT_DIR\funciones_dhcp.ps1") {
+    . "$SCRIPT_DIR\funciones_dhcp.ps1"
+    Write-Host "✓ Módulo funciones_dhcp.ps1 cargado" -ForegroundColor Green
+} else {
+    Write-Host "✗ Error: No se encuentra funciones_dhcp.ps1" -ForegroundColor Red
+    exit 1
+}
+
+# Funciones DNS
+if (Test-Path "$SCRIPT_DIR\funciones_dns.ps1") {
+    . "$SCRIPT_DIR\funciones_dns.ps1"
+    Write-Host "✓ Módulo funciones_dns.ps1 cargado" -ForegroundColor Green
+} else {
+    Write-Host "✗ Error: No se encuentra funciones_dns.ps1" -ForegroundColor Red
+    exit 1
+}
+
+# Funciones SSH
+if (Test-Path "$SCRIPT_DIR\funciones_ssh.ps1") {
+    . "$SCRIPT_DIR\funciones_ssh.ps1"
+    Write-Host "✓ Módulo funciones_ssh.ps1 cargado" -ForegroundColor Green
+} else {
+    Write-Host "✗ Error: No se encuentra funciones_ssh.ps1" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "`nTodos los módulos cargados correctamente." -ForegroundColor Green
+Start-Sleep -Seconds 2
+
+# =========================
+# FUNCIONES ADICIONALES
+# =========================
+
+function Instalar-TodosRoles {
+    Write-Color "`n--- INSTALANDO TODOS LOS ROLES ---" $CYAN
+    
+    Instalar-DHCP
+    Instalar-DNS
+    Instalar-SSHWindows
+    
+    Configurar-FirewallPing
+}
+
+function Configurar-IPEstatica {
+    $CURRENT_IP = Obtener-IPActual
+    Write-Color "`n--- CONFIGURACIÓN IP ESTÁTICA ($INTERFACE) ---" $YELLOW
+    Write-Host "IP Actual: $CURRENT_IP"
+    
+    $resp = Read-Host "`n¿Configurar IP ESTATICA nueva? (s/n)"
+    if ($resp -eq "s") {
+        do {
+            $nuevaIP = Read-Host "Ingrese IP Estática"
+        } while (-not (Validar-IPCompleta $nuevaIP))
+        
+        $mask = Read-Host "Máscara de red [Enter=24]" 
+        if ([string]::IsNullOrEmpty($mask)) { $mask = 24 }
+        
+        $gateway = Read-Host "Gateway (Enter para omitir)"
+        
+        Write-Color "Aplicando configuración..." $CYAN
+        
+        try {
+            # Eliminar IP actual
+            Get-NetIPAddress -InterfaceAlias $INTERFACE -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false
+            
+            # Configurar nueva IP
+            if ([string]::IsNullOrEmpty($gateway)) {
+                New-NetIPAddress -InterfaceAlias $INTERFACE -IPAddress $nuevaIP -PrefixLength $mask
+            } else {
+                New-NetIPAddress -InterfaceAlias $INTERFACE -IPAddress $nuevaIP -PrefixLength $mask -DefaultGateway $gateway
+            }
+            
+            # Configurar DNS
+            Set-DnsClientServerAddress -InterfaceAlias $INTERFACE -ServerAddresses "127.0.0.1"
+            
+            Configurar-FirewallPing
+            
+            Write-Color "IP $nuevaIP asignada a $INTERFACE." $GREEN
+        }
+        catch {
+            Write-Color "Error al configurar IP: $_" $RED
+        }
+    }
+}
+
+function Verificar-InstalacionCompleta {
+    Write-Color "`n--- VERIFICACIÓN COMPLETA DEL SISTEMA ---" $CYAN
+    
+    # Verificar IPs
+    Write-Color "`nIPs configuradas en $INTERFACE:" $CYAN
+    Get-NetIPAddress -InterfaceAlias $INTERFACE -AddressFamily IPv4 | Format-Table IPAddress, PrefixLength
+    
+    # Verificar servicios
+    Write-Color "`nEstado de servicios:" $CYAN
+    
+    # DHCP
+    $dhcpServer = Get-WindowsFeature -Name DHCP
+    if ($dhcpServer.Installed) {
+        Write-Host "  DHCP: Instalado" -ForegroundColor Green
+        $dhcpService = Get-Service -Name DHCPServer -ErrorAction SilentlyContinue
+        if ($dhcpService -and $dhcpService.Status -eq "Running") {
+            Write-Host "         ✓ Activo" -ForegroundColor Green
+        } else {
+            Write-Host "         ✗ Inactivo" -ForegroundColor Red
+        }
+    }
+    
+    # DNS
+    $dnsServer = Get-WindowsFeature -Name DNS
+    if ($dnsServer.Installed) {
+        Write-Host "  DNS:   Instalado" -ForegroundColor Green
+        $dnsService = Get-Service -Name DNS -ErrorAction SilentlyContinue
+        if ($dnsService -and $dnsService.Status -eq "Running") {
+            Write-Host "         ✓ Activo" -ForegroundColor Green
+        } else {
+            Write-Host "         ✗ Inactivo" -ForegroundColor Red
+        }
+    }
+    
+    # SSH
+    $sshCapability = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Server*' }
+    if ($sshCapability.State -eq 'Installed') {
+        Write-Host "  SSH:   Instalado" -ForegroundColor Green
+        $sshService = Get-Service -Name sshd -ErrorAction SilentlyContinue
+        if ($sshService -and $sshService.Status -eq "Running") {
+            Write-Host "         ✓ Activo" -ForegroundColor Green
+        } else {
+            Write-Host "         ✗ Inactivo" -ForegroundColor Red
+        }
+    }
+}
+
+function Generar-InformacionConexion {
+    $SERVER_IP = Obtener-IPActual
+    
+    Write-Color "`n--- INFORMACIÓN DE CONEXIÓN PARA CLIENTES ---" $CYAN
+    Write-Color "`nServidor Windows Server 2022:" $YELLOW
+    Write-Host "  IP: $SERVER_IP"
+    Write-Host "  Usuario: $env:USERNAME"
+    Write-Host "  Dominio: $env:USERDOMAIN"
+    
+    Write-Color "`nPara conectarte por SSH:" $GREEN
+    Write-Host "  ssh $env:USERNAME@$SERVER_IP"
+    
+    Write-Color "`nPara configurar DNS en clientes:" $GREEN
+    Write-Host "  En Windows: netsh interface ip set dns name='Ethernet' static $SERVER_IP"
+    Write-Host "  En Linux: echo 'nameserver $SERVER_IP' > /etc/resolv.conf"
+    
+    Read-Host "`nPresiona Enter para continuar..."
+}
+
+# =========================
+# VERIFICACIÓN INICIAL
+# =========================
+
+Check-Administrator
+
+# Seleccionar interfaz
+Seleccionar-Interfaz
+
+# Mostrar información del sistema
+Write-Color "`nSistema detectado: Windows Server 2022" $CYAN
+Write-Color "Interfaz interna: $INTERFACE" $CYAN
+$ipActual = Obtener-IPActual
+Write-Color "IP principal: $ipActual" $CYAN
+Start-Sleep -Seconds 2
+
+# =========================
+# MENÚ PRINCIPAL
+# =========================
+
+while ($true) {
+    Clear-Host
+    $IP_ACTUAL = Obtener-IPActual
+    $IPS_COUNT = (Get-NetIPAddress -InterfaceAlias $INTERFACE -AddressFamily IPv4).Count
+    $IPS_VIRT_COUNT = $IPS_COUNT - 1
+    
+    Write-Host "===============================================" -ForegroundColor Yellow
+    Write-Host "   GESTOR DE INFRAESTRUCTURA - WINDOWS 2022   " -ForegroundColor Yellow
+    Write-Host "===============================================" -ForegroundColor Yellow
+    Write-Host "Interfaz:       $INTERFACE" -ForegroundColor Green
+    Write-Host "IP Principal:   $IP_ACTUAL" -ForegroundColor Green
+    Write-Host "IPs Virtuales:  $IPS_VIRT_COUNT" -ForegroundColor Green
+    Write-Host "===============================================" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  1)  Verificar instalación completa"
+    Write-Host "  2)  Instalar todos los roles (DHCP + DNS + SSH)"
+    Write-Host ""
+    Write-Host "  --- CONFIGURACIÓN DE RED ---"
+    Write-Host "  3)  Configurar IP Estática (principal)"
+    Write-Host ""
+    Write-Host "  --- SERVICIOS ---"
+    Write-Host "  4)  Configurar servidor DHCP"
+    Write-Host "  5)  Gestión de dominios DNS (con IPs virtuales)"
+    Write-Host "  6)  Gestión de SSH (acceso remoto)"
+    Write-Host ""
+    Write-Host "  --- PRUEBAS Y UTILIDADES ---"
+    Write-Host "  7)  Información para clientes"
+    Write-Host "  8)  Salir"
+    Write-Host ""
+    Write-Host "===============================================" -ForegroundColor Yellow
+    
+    $MAIN_OPC = Read-Host "`nSeleccione una opción [1-8]"
+    
+    switch ($MAIN_OPC) {
+        "1" { Verificar-InstalacionCompleta; Read-Host "Presiona Enter..." }
+        "2" { Instalar-TodosRoles; Read-Host "Presiona Enter..." }
+        "3" { Configurar-IPEstatica; Read-Host "Presiona Enter..." }
+        "4" { Configurar-DHCP; Read-Host "Presiona Enter..." }
+        "5" { submenu_dns }
+        "6" { submenu_ssh }
+        "7" { Generar-InformacionConexion }
+        "8" { 
+            Write-Color "`n¡Hasta luego!" $GREEN
+            exit 0 
+        }
+        default { 
+            Write-Color "Opción inválida" $RED
+            Start-Sleep -Seconds 1
+        }
+    }
+}
