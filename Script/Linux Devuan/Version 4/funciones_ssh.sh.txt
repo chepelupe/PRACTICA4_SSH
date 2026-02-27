@@ -1,0 +1,227 @@
+#!/bin/bash
+# ==============================================================================
+# FUNCIONES SSH - VERSION ULTRA CORREGIDA PARA DEVUAN
+# ==============================================================================
+
+source ./funciones_compartidas.sh
+
+verificar_instalacion_ssh() {
+    echo ""
+    echo "--- VERIFICANDO SERVICIO SSH ---"
+    
+    if dpkg -s openssh-server >/dev/null 2>&1; then 
+        echo "[OK] OPENSSH SERVER INSTALADO"
+    else 
+        echo "[X] OPENSSH SERVER NO INSTALADO"
+        return 1
+    fi
+    
+    if service ssh status >/dev/null 2>&1; then
+        if service ssh status | grep -q "running"; then
+            echo "[OK] SERVICIO SSH ACTIVO"
+        else
+            echo "[X] SERVICIO SSH INACTIVO"
+        fi
+    else
+        echo "[X] SERVICIO SSH NO DISPONIBLE"
+    fi
+}
+
+activar_eth2() {
+    echo ""
+    echo "--- ACTIVANDO ETH2 (MODO FORZADO) ---"
+    
+    if ! ip link show eth2 > /dev/null 2>&1; then
+        echo "ERROR: ETH2 NO EXISTE"
+        return 1
+    fi
+    
+    echo "PASO 1: DERRIBANDO ETH2..."
+    ip link set eth2 down
+    sleep 2
+    
+    echo "PASO 2: ACTIVANDO ETH2..."
+    ip link set eth2 up
+    sleep 2
+    
+    echo "PASO 3: REACTIVANDO ETH2..."
+    ip link set eth2 up
+    sleep 2
+    
+    echo "PASO 4: ASIGNANDO IP 192.168.56.10..."
+    ip addr flush dev eth2 2>/dev/null
+    ip addr add 192.168.56.10/24 dev eth2
+    sleep 2
+    
+    echo "PASO 5: VERIFICANDO ESTADO..."
+    ip link show eth2 | grep -q "UP"
+    if [ $? -eq 0 ]; then
+        echo "[OK] ETH2 ACTIVADA"
+    else
+        echo "[ERROR] NO SE PUDO ACTIVAR ETH2"
+        return 1
+    fi
+    
+    echo "PASO 6: VERIFICANDO IP..."
+    ip addr show eth2 | grep -q "192.168.56.10"
+    if [ $? -eq 0 ]; then
+        echo "[OK] IP 192.168.56.10 ASIGNADA"
+    else
+        echo "[ERROR] IP NO ASIGNADA"
+        return 1
+    fi
+    
+    echo "PASO 7: VERIFICANDO RUTAS..."
+    ip route | grep -q "192.168.56.0/24 dev eth2"
+    if [ $? -eq 0 ]; then
+        echo "[OK] RUTA CONFIGURADA"
+    else
+        echo "[AVISO] RUTA NO CONFIGURADA, AGREGANDO..."
+        ip route add 192.168.56.0/24 dev eth2 2>/dev/null
+    fi
+    
+    return 0
+}
+
+verificar_eth2() {
+    echo ""
+    echo "--- VERIFICACION COMPLETA DE ETH2 ---"
+    echo ""
+    echo "ESTADO DE LA INTERFAZ:"
+    ip link show eth2
+    echo ""
+    echo "DIRECCIONES IP:"
+    ip addr show eth2 | grep inet || echo "  SIN IP ASIGNADA"
+    echo ""
+    echo "RUTAS:"
+    ip route | grep eth2 || echo "  SIN RUTAS"
+    echo ""
+    echo "ESTADISTICAS:"
+    ip -s link show eth2 | grep -A2 "RX" | head -4
+}
+
+configurar_ssh_eth2() {
+    echo ""
+    echo "--- CONFIGURACION DE SSH EN ETH2 (HOST-ONLY) ---"
+    
+    if ! ip link show eth2 > /dev/null 2>&1; then
+        echo "ERROR: ETH2 NO EXISTE"
+        return 1
+    fi
+    
+    activar_eth2
+    if [ $? -ne 0 ]; then
+        echo "ERROR: NO SE PUDO ACTIVAR ETH2"
+        return 1
+    fi
+    
+    echo "VERIFICANDO INSTALACION SSH..."
+    if ! command -v sshd >/dev/null 2>&1; then
+        echo "INSTALANDO OPENSSH-SERVER..."
+        apt-get update
+        apt-get install -y openssh-server
+    fi
+    
+    echo "CONFIGURANDO SSHD..."
+    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup 2>/dev/null
+    
+    cat > /etc/ssh/sshd_config <<EOF
+Port 22
+ListenAddress 0.0.0.0
+Protocol 2
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+PermitRootLogin yes
+PasswordAuthentication yes
+ChallengeResponseAuthentication no
+UsePAM yes
+X11Forwarding yes
+PrintMotd no
+AcceptEnv LANG LC_*
+Subsystem sftp /usr/lib/openssh/sftp-server
+EOF
+    
+    echo "CONFIGURACION PERMANENTE EN INTERFACES..."
+    if ! grep -q "iface eth2" /etc/network/interfaces; then
+        cat >> /etc/network/interfaces <<EOF
+
+auto eth2
+iface eth2 inet static
+    address 192.168.56.10
+    netmask 255.255.255.0
+    pre-up ip link set eth2 up
+    up ip link set eth2 up
+    post-up ip addr add 192.168.56.10/24 dev eth2 2>/dev/null
+    down ip addr del 192.168.56.10/24 dev eth2
+    down ip link set eth2 down
+EOF
+        echo "CONFIGURACION PERMANENTE AGREGADA"
+    else
+        echo "CONFIGURACION PERMANENTE YA EXISTE"
+    fi
+    
+    echo "REINICIANDO SERVICIO SSH..."
+    service ssh restart
+    sleep 3
+    
+    echo "REINICIANDO RED..."
+    service networking restart 2>/dev/null
+    sleep 3
+    
+    activar_eth2
+    
+    echo ""
+    echo "--- VERIFICACION FINAL ---"
+    echo ""
+    echo "ESTADO ETH2:"
+    ip link show eth2 | grep "UP" && echo "  [OK] INTERFAZ ACTIVA" || echo "  [ERROR] INTERFAZ INACTIVA"
+    ip addr show eth2 | grep "192.168.56.10" && echo "  [OK] IP CORRECTA" || echo "  [ERROR] IP INCORRECTA"
+    
+    echo ""
+    echo "ESTADO SSH:"
+    netstat -tlnp 2>/dev/null | grep :22 && echo "  [OK] PUERTO 22 ESCUCHANDO" || echo "  [ERROR] PUERTO 22 NO ESCUCHA"
+    
+    echo ""
+    echo "================================================"
+    echo "SSH CONFIGURADO EN ETH2"
+    echo "IP: 192.168.56.10"
+    echo "USUARIO: $(whoami)"
+    echo "================================================"
+    echo ""
+    echo "PRUEBA DESDE WINDOWS (POWERSHELL):"
+    echo "  ssh $(whoami)@192.168.56.10"
+    echo ""
+    echo "SI NO FUNCIONA, VERIFICA MANUALMENTE:"
+    echo "  1. ip link set eth2 up"
+    echo "  2. ip addr add 192.168.56.10/24 dev eth2"
+    echo "  3. service ssh restart"
+    echo "  4. netstat -tlnp | grep :22"
+    echo "================================================"
+}
+
+submenu_ssh() {
+    while true; do
+        clear
+        echo ""
+        echo "========================================"
+        echo "   GESTION DE SSH                       "
+        echo "========================================"
+        echo "1) VERIFICAR ESTADO DE SSH"
+        echo "2) ACTIVAR ETH2 (MODO FORZADO)"
+        echo "3) VERIFICAR ESTADO DE ETH2"
+        echo "4) CONFIGURAR SSH EN ETH2"
+        echo "5) VOLVER"
+        echo "========================================"
+        
+        read -p "SELECCIONE OPCION: " subopc
+        case $subopc in
+            1) verificar_instalacion_ssh; read -p "PRESIONE ENTER..." ;;
+            2) activar_eth2; read -p "PRESIONE ENTER..." ;;
+            3) verificar_eth2; read -p "PRESIONE ENTER..." ;;
+            4) configurar_ssh_eth2; read -p "PRESIONE ENTER..." ;;
+            5) return ;;
+            *) echo "OPCION INVALIDA"; sleep 1 ;;
+        esac
+    done
+}

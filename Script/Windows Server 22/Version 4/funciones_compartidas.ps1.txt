@@ -1,0 +1,244 @@
+$global:INTERFACE = ""
+$global:IPS_VIRTUALES = @()
+$global:SSH_INTERFACE_EXCLUSIVA = ""
+$global:SSH_IP_EXCLUSIVA = ""
+
+function Check-Administrator {
+    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Host "ERROR: EJECUTAR COMO ADMINISTRADOR"
+        Read-Host "PRESIONE ENTER PARA SALIR"
+        exit 1
+    }
+    Write-Host "OK: ADMINISTRADOR"
+}
+
+function Validar-IP {
+    param([string]$ip)
+    if ($ip -match '^([0-9]{1,3}\.){3}[0-9]{1,3}$') {
+        $octetos = $ip.Split('.')
+        foreach ($octeto in $octetos) {
+            if ([int]$octeto -lt 0 -or [int]$octeto -gt 255) { return $false }
+        }
+        if ($ip -eq "0.0.0.0" -or $ip -eq "255.255.255.255") { return $false }
+        if ($ip -like "127.*") { return $false }
+        $firstOctet = [int]($ip.Split('.')[0])
+        if ($firstOctet -ge 224) { return $false }
+        return $true
+    }
+    return $false
+}
+
+function Seleccionar-Interfaz {
+    Clear-Host
+    Write-Host "--- SELECCION DE INTERFAZ DE RED ---"
+    $interfaces = Get-NetAdapter | Where-Object { $_.Status -eq "Up" }
+    $index = 1
+    $interfaceList = @{}
+    foreach ($iface in $interfaces) {
+        $ipInfo = Get-NetIPAddress -InterfaceIndex $iface.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        $ipAddress = if ($ipInfo) { $ipInfo.IPAddress } else { "SIN IP" }
+        Write-Host "$index) $($iface.Name) - $ipAddress"
+        $interfaceList[$index] = $iface.Name
+        $index++
+    }
+    
+    Write-Host ""
+    Write-Host "NOTA: SELECCIONA LA INTERFAZ DE RED INTERNA"
+    do {
+        $selection = Read-Host "NUMERO"
+    } while (-not $interfaceList.ContainsKey([int]$selection))
+    
+    $global:INTERFACE = $interfaceList[[int]$selection]
+    Write-Host "TRABAJANDO SOBRE: $global:INTERFACE"
+    Start-Sleep -Seconds 1
+}
+
+function Obtener-IPActual {
+    param([string]$interfaz)
+    if (-not $interfaz) { $interfaz = $global:INTERFACE }
+    if (-not $interfaz) { return $null }
+    $ipInfo = Get-NetIPAddress -InterfaceAlias $interfaz -AddressFamily IPv4 -ErrorAction SilentlyContinue
+    if ($ipInfo) { return $ipInfo.IPAddress }
+    return $null
+}
+
+function Configurar-FirewallPing {
+    Write-Host "CONFIGURANDO FIREWALL PARA PERMITIR PING (ICMP)..."
+    try {
+        New-NetFirewallRule -DisplayName "ICMP Allow PING" -Direction Inbound -Protocol ICMPv4 -Action Allow -ErrorAction SilentlyContinue
+        Write-Host "REGLAS ICMP APLICADAS"
+    } catch {
+        Write-Host "ERROR AL CONFIGURAR FIREWALL: $_"
+    }
+}
+
+function Crear-IPVirtual {
+    param([string]$ip, [string]$interfaz)
+    
+    Write-Host "--- VERIFICANDO IP VIRTUAL: $ip ---"
+    
+    $existingIP = Get-NetIPAddress -InterfaceAlias $interfaz -IPAddress $ip -ErrorAction SilentlyContinue
+    if ($existingIP) {
+        Write-Host "LA IP $ip YA ESTA CONFIGURADA EN $interfaz"
+        return $true
+    }
+    
+    $ipPrincipal = Obtener-IPActual -interfaz $interfaz
+    if ($ip -eq $ipPrincipal) {
+        Write-Host "ERROR: NO PUEDES USAR LA IP PRINCIPAL ($ipPrincipal) COMO VIRTUAL"
+        return $false
+    }
+    
+    Write-Host "CREANDO IP VIRTUAL: $ip EN $interfaz..."
+    
+    try {
+        New-NetIPAddress -InterfaceAlias $interfaz -IPAddress $ip -PrefixLength 24 -ErrorAction Stop
+        Write-Host "COMANDO EJECUTADO CORRECTAMENTE"
+        Start-Sleep -Seconds 1
+        
+        $verifyIP = Get-NetIPAddress -InterfaceAlias $interfaz -IPAddress $ip -ErrorAction SilentlyContinue
+        if ($verifyIP) {
+            Write-Host "IP VIRTUAL $ip CREADA Y VERIFICADA EXITOSAMENTE"
+            $global:IPS_VIRTUALES += $ip
+            
+            Write-Host ""
+            Write-Host "ESTADO ACTUAL DE ${interfaz}:"
+            Get-NetIPAddress -InterfaceAlias $interfaz -AddressFamily IPv4 | ForEach-Object {
+                Write-Host "  $($_.IPAddress)"
+            }
+            return $true
+        } else {
+            Write-Host "ERROR: LA IP $ip NO APARECE DESPUES DE CREARLA"
+            return $false
+        }
+    } catch {
+        Write-Host "ERROR AL EJECUTAR COMANDO: $_"
+        return $false
+    }
+}
+
+function Eliminar-IPVirtual {
+    param([string]$ip, [string]$interfaz)
+    
+    Write-Host "--- ELIMINANDO IP VIRTUAL: $ip ---"
+    
+    $existingIP = Get-NetIPAddress -InterfaceAlias $interfaz -IPAddress $ip -ErrorAction SilentlyContinue
+    if ($existingIP) {
+        Write-Host "ELIMINANDO IP VIRTUAL: $ip DE $interfaz..."
+        try {
+            Remove-NetIPAddress -InterfaceAlias $interfaz -IPAddress $ip -Confirm:$false -ErrorAction Stop
+            Write-Host "IP VIRTUAL $ip ELIMINADA"
+            
+            Write-Host ""
+            Write-Host "ESTADO ACTUAL DE ${interfaz}:"
+            Get-NetIPAddress -InterfaceAlias $interfaz -AddressFamily IPv4 | ForEach-Object {
+                Write-Host "  $($_.IPAddress)"
+            }
+            return $true
+        } catch {
+            Write-Host "ERROR AL ELIMINAR IP VIRTUAL ${ip}: $_"
+            return $false
+        }
+    } else {
+        Write-Host "LA IP $ip NO EXISTE EN $interfaz"
+        return $true
+    }
+}
+
+function Seleccionar-InterfazSSHExclusiva {
+    Clear-Host
+    Write-Host ""
+    Write-Host "--- SELECCION DE INTERFAZ EXCLUSIVA PARA SSH ---"
+    Write-Host "INTERFACES DISPONIBLES:"
+    
+    $interfaces = Get-NetAdapter | Where-Object { $_.Status -eq "Up" }
+    if ($interfaces.Count -eq 0) {
+        Write-Host "ERROR: NO HAY INTERFACES DE RED ACTIVAS"
+        return $false
+    }
+    
+    $index = 1
+    $interfaceList = @{}
+    foreach ($iface in $interfaces) {
+        $ipInfo = Get-NetIPAddress -InterfaceIndex $iface.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        $ipAddress = if ($ipInfo) { $ipInfo.IPAddress } else { "SIN IP" }
+        Write-Host "$index) $($iface.Name) - $ipAddress"
+        $interfaceList[$index] = $iface.Name
+        $index++
+    }
+    
+    Write-Host ""
+    Write-Host "NOTA: SELECCIONA LA INTERFAZ DEDICADA PARA SSH"
+    Write-Host "      (DEBE SER UNA RED DIFERENTE A LA INTERNA)"
+    
+    do {
+        $selection = Read-Host "NUMERO"
+    } while (-not $interfaceList.ContainsKey([int]$selection))
+    
+    $global:SSH_INTERFACE_EXCLUSIVA = $interfaceList[[int]$selection]
+    Write-Host "INTERFAZ SELECCIONADA: $global:SSH_INTERFACE_EXCLUSIVA"
+    
+    # VERIFICAR SI YA TIENE IP
+    $ip_actual = Obtener-IPActual -interfaz $global:SSH_INTERFACE_EXCLUSIVA
+    
+    if ($ip_actual) {
+        Write-Host ""
+        Write-Host "INTERFAZ $global:SSH_INTERFACE_EXCLUSIVA TIENE IP: $ip_actual"
+        $usar_ip_actual = Read-Host "USAR ESTA IP PARA SSH? (S/N)"
+        if ($usar_ip_actual -eq "s") {
+            $global:SSH_IP_EXCLUSIVA = $ip_actual
+            Write-Host "USANDO IP EXISTENTE: $global:SSH_IP_EXCLUSIVA"
+            Write-Host ""
+            Write-Host "INTERFAZ SSH EXCLUSIVA: $global:SSH_INTERFACE_EXCLUSIVA"
+            Write-Host "IP SSH EXCLUSIVA: $global:SSH_IP_EXCLUSIVA"
+            Start-Sleep -Seconds 2
+            return $true
+        }
+    }
+    
+    # SI NO TIENE IP O EL USUARIO QUIERE CAMBIARLA
+    Write-Host ""
+    Write-Host "CONFIGURANDO IP PARA INTERFAZ SSH EXCLUSIVA"
+    Write-Host "RECOMENDACION: USA UNA IP ESTATICA EN UN RANGO DIFERENTE"
+    Write-Host "EJEMPLO: 192.168.2.100 (SI LA INTERNA ES 192.168.1.x)"
+    
+    do {
+        $nueva_ip = Read-Host "INGRESE IP PARA $global:SSH_INTERFACE_EXCLUSIVA"
+        $ip_valida = Validar-IP $nueva_ip
+        if (-not $ip_valida) {
+            Write-Host "IP INVALIDA O PROHIBIDA. INTENTA DE NUEVO."
+        }
+    } while (-not $ip_valida)
+    
+    $global:SSH_IP_EXCLUSIVA = $nueva_ip
+    
+    # PREGUNTAR SI CONFIGURAR LA IP AHORA
+    Write-Host ""
+    Write-Host "IP SELECCIONADA: $global:SSH_IP_EXCLUSIVA"
+    $config_ahora = Read-Host "CONFIGURAR ESTA IP AHORA EN $global:SSH_INTERFACE_EXCLUSIVA? (S/N)"
+    
+    if ($config_ahora -eq "s") {
+        Write-Host "CONFIGURANDO IP $global:SSH_IP_EXCLUSIVA EN $global:SSH_INTERFACE_EXCLUSIVA..."
+        
+        # ELIMINAR CONFIGURACION EXISTENTE
+        $existingIP = Get-NetIPAddress -InterfaceAlias $global:SSH_INTERFACE_EXCLUSIVA -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        if ($existingIP) {
+            Remove-NetIPAddress -InterfaceAlias $global:SSH_INTERFACE_EXCLUSIVA -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        
+        # AGREGAR NUEVA IP
+        try {
+            New-NetIPAddress -InterfaceAlias $global:SSH_INTERFACE_EXCLUSIVA -IPAddress $global:SSH_IP_EXCLUSIVA -PrefixLength 24 -ErrorAction Stop
+            Write-Host "IP CONFIGURADA TEMPORALMENTE"
+        } catch {
+            Write-Host "ERROR AL CONFIGURAR IP: $_"
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "INTERFAZ SSH EXCLUSIVA: $global:SSH_INTERFACE_EXCLUSIVA"
+    Write-Host "IP SSH EXCLUSIVA: $global:SSH_IP_EXCLUSIVA"
+    Start-Sleep -Seconds 2
+    return $true
+}

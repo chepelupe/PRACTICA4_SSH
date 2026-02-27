@@ -1,0 +1,293 @@
+#!/bin/bash
+# ==============================================================================
+# FUNCIONES DNS - VERSION CORREGIDA (PERMITE MISMA IP DEL SERVIDOR)
+# ==============================================================================
+
+source ./funciones_compartidas.sh
+
+verificar_instalacion_dns() {
+    echo ""
+    echo "--- VERIFICANDO PAQUETES DNS ---"
+    
+    if dpkg -s bind9 >/dev/null 2>&1; then 
+        echo "[OK] DNS SERVER (BIND9) INSTALADO"
+        if [ -f "/etc/init.d/named" ]; then
+            echo "      SERVICIO: NAMED"
+        fi
+    else 
+        echo "[X] DNS SERVER NO INSTALADO"
+    fi
+}
+
+instalar_dns() {
+    echo "INSTALANDO SERVIDOR DNS (BIND9)..."
+    
+    apt update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y bind9 bind9utils dnsutils
+    
+    if [ $? -eq 0 ]; then
+        echo "INSTALACION DNS COMPLETADA."
+        
+        if [ -f "/etc/init.d/named" ]; then
+            update-rc.d named defaults > /dev/null 2>&1
+            echo "SERVICIO NAMED CONFIGURADO PARA INICIO AUTOMATICO"
+        fi
+    else
+        echo "ERROR EN LA INSTALACION DNS."
+    fi
+}
+
+reiniciar_servicio_dns() {
+    echo "REINICIANDO SERVICIO DNS (NAMED)..."
+    
+    if [ -f "/etc/init.d/named" ]; then
+        /etc/init.d/named stop
+        sleep 2
+        /etc/init.d/named start
+        sleep 3
+        return 0
+    fi
+    
+    return 1
+}
+
+configurar_resolv_conf() {
+    local SERVER_IP=$1
+    echo "CONFIGURANDO /etc/resolv.conf..."
+    
+    cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null
+    
+    cat > /etc/resolv.conf <<EOF
+nameserver $SERVER_IP
+EOF
+    
+    chattr +i /etc/resolv.conf 2>/dev/null
+    echo "RESOLV.CONF CONFIGURADO CON DNS $SERVER_IP"
+}
+
+configurar_opciones_bind() {
+    local SERVER_IP=$1
+    
+    echo "CONFIGURANDO OPCIONES DE BIND..."
+    
+    cat > /etc/bind/named.conf.options <<EOF
+options {
+    directory "/var/cache/bind";
+    listen-on { $SERVER_IP; 127.0.0.1; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    recursion yes;
+    
+    forwarders {
+        8.8.8.8;
+        8.8.4.4;
+    };
+    
+    dnssec-validation no;
+    check-names master ignore;
+};
+EOF
+
+    echo "OPCIONES DE BIND CONFIGURADAS"
+}
+
+agregar_zona() {
+    SERVER_IP=$(obtener_ip_actual)
+    if [ -z "$SERVER_IP" ]; then 
+        SERVER_IP=$(ip -4 addr show $INTERFACE | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
+        [ -z "$SERVER_IP" ] && SERVER_IP="192.168.56.100"
+    fi
+    
+    echo ""
+    echo "--- AGREGAR ZONA DNS ---"
+    
+    read -p "NOMBRE DEL DOMINIO: " dominio
+    [ -z "$dominio" ] && return
+    
+    local virtual_ip=""
+    while true; do
+        read -p "IP VIRTUAL PARA $dominio: " virtual_ip
+        validar_ip_completa "$virtual_ip" || continue
+        
+        # SOLO VERIFICAR QUE ESTE EN LA RED CORRECTA
+        local red_ip=$(echo $virtual_ip | cut -d'.' -f1-3)
+        if [ "$red_ip" != "192.168.56" ]; then
+            echo "ERROR: LA IP DEBE ESTAR EN LA RED 192.168.56.0/24"
+            continue
+        fi
+        
+        # AVISO SI USA LA MISMA IP DEL SERVIDOR
+        if [ "$virtual_ip" == "$SERVER_IP" ]; then
+            echo "AVISO: USANDO LA MISMA IP DEL SERVIDOR"
+        fi
+        
+        break
+    done
+    
+    echo ""
+    echo "CREANDO IP VIRTUAL..."
+    crear_ip_virtual "$virtual_ip" "$INTERFACE"
+    
+    # EXTRAER OCTETOS DE LA IP VIRTUAL
+    OCT1=$(echo $virtual_ip | cut -d'.' -f1)
+    OCT2=$(echo $virtual_ip | cut -d'.' -f2)
+    OCT3=$(echo $virtual_ip | cut -d'.' -f3)
+    OCT4=$(echo $virtual_ip | cut -d'.' -f4)
+    
+    CONF="/etc/bind/named.conf.local"
+    FILE="/var/cache/bind/db.$dominio"
+    
+    mkdir -p /var/cache/bind
+    
+    # CONFIGURAR OPCIONES DE BIND SI NO EXISTEN
+    if [ ! -f "/etc/bind/named.conf.options" ]; then
+        configurar_opciones_bind "$SERVER_IP"
+    fi
+    
+    # VERIFICAR SI LA ZONA DIRECTA YA EXISTE
+    if [ -f "$CONF" ] && grep -q "zone \"$dominio\"" "$CONF" 2>/dev/null; then
+        echo "LA ZONA DIRECTA YA EXISTE."
+        read -p "RECREAR? (S/N): " rec
+        [ "$rec" != "S" ] && [ "$rec" != "s" ] && return
+        sed -i "/zone \"$dominio\" {/,/};/d" "$CONF"
+    fi
+    
+    # AGREGAR ZONA DIRECTA
+    cat >> "$CONF" <<EOF
+
+zone "$dominio" {
+    type master;
+    file "$FILE";
+};
+EOF
+
+    # CREAR ARCHIVO DE ZONA DIRECTA
+    cat > "$FILE" <<EOF
+\$TTL 604800
+@ IN SOA ns1.$dominio. admin.$dominio. (
+    $(date +%Y%m%d)01
+    604800
+    86400
+    2419200
+    604800 )
+
+; SERVIDORES DE NOMBRES
+@ IN NS ns1.$dominio.
+@ IN NS ns2.$dominio.
+
+; REGISTROS A
+ns1.$dominio. IN A $SERVER_IP
+ns2.$dominio. IN A $SERVER_IP
+$dominio. IN A $virtual_ip
+www.$dominio. IN A $virtual_ip
+mail.$dominio. IN A $virtual_ip
+ftp.$dominio. IN A $virtual_ip
+
+; REGISTRO MX
+$dominio. IN MX 10 mail.$dominio.
+EOF
+    
+    chmod 644 "$FILE"
+    chown bind:bind "$FILE" 2>/dev/null
+    
+    echo ""
+    echo "VERIFICANDO SINTAXIS DE LA ZONA..."
+    named-checkzone "$dominio" "$FILE"
+    
+    echo ""
+    echo "REINICIANDO SERVICIO DNS..."
+    reiniciar_servicio_dns
+    
+    echo ""
+    echo "CONFIGURANDO RESOLV.CONF..."
+    configurar_resolv_conf "$SERVER_IP"
+    
+    echo ""
+    echo "================================================"
+    echo "DOMINIO CONFIGURADO: $dominio"
+    echo "IP VIRTUAL: $virtual_ip"
+    echo "SERVIDOR DNS: $SERVER_IP"
+    echo "================================================"
+    echo ""
+    echo "PRUEBAS LOCALES:"
+    echo "  nslookup $dominio"
+    echo "  nslookup $virtual_ip"
+    echo "  ping $dominio"
+    echo "================================================"
+}
+
+eliminar_zona() {
+    echo ""
+    echo "--- ELIMINAR ZONA DNS ---"
+    CONF="/etc/bind/named.conf.local"
+    
+    if [ ! -f "$CONF" ]; then
+        echo "NO HAY ARCHIVO DE CONFIGURACION"
+        return
+    fi
+    
+    echo "ZONAS ACTUALES:"
+    grep "zone" "$CONF" | grep -v "in-addr.arpa" | cut -d'"' -f2
+    
+    read -p "NOMBRE DE LA ZONA A BORRAR: " zona_del
+    [ -z "$zona_del" ] && return
+    
+    if grep -q "zone \"$zona_del\"" "$CONF"; then
+        archivo="/var/cache/bind/db.$zona_del"
+        if [ -f "$archivo" ]; then
+            virtual_ip=$(grep -E "^$zona_del\.\s+IN\s+A" "$archivo" | awk '{print $4}')
+            if [ -n "$virtual_ip" ]; then
+                echo "ELIMINANDO IP VIRTUAL $virtual_ip"
+                eliminar_ip_virtual "$virtual_ip" "$INTERFACE"
+            fi
+        fi
+        
+        sed -i "/zone \"$zona_del\" {/,/};/d" "$CONF"
+        rm -f "$archivo"
+        
+        reiniciar_servicio_dns
+        echo "ZONA ELIMINADA"
+    else
+        echo "ZONA NO ENCONTRADA"
+    fi
+}
+
+listar_zonas() {
+    echo ""
+    echo "--- DOMINIOS CONFIGURADOS ---"
+    if [ -f "/etc/bind/named.conf.local" ]; then
+        grep "zone" /etc/bind/named.conf.local | grep -v "in-addr.arpa" | cut -d'"' -f2
+    else
+        echo "NO HAY ZONAS CONFIGURADAS"
+    fi
+}
+
+submenu_dns() {
+    while true; do
+        clear
+        echo ""
+        echo "========================================"
+        echo "   GESTION DE DNS                       "
+        echo "========================================"
+        echo "1) VERIFICAR INSTALACION DNS"
+        echo "2) INSTALAR SERVIDOR DNS"
+        echo "3) AGREGAR ZONA"
+        echo "4) ELIMINAR ZONA"
+        echo "5) LISTAR ZONAS"
+        echo "6) REINICIAR NAMED"
+        echo "7) VOLVER"
+        echo "========================================"
+        
+        read -p "SELECCIONE OPCION: " subopc
+        case $subopc in
+            1) verificar_instalacion_dns; read -p "PRESIONE ENTER..." ;;
+            2) instalar_dns; read -p "PRESIONE ENTER..." ;;
+            3) agregar_zona; read -p "PRESIONE ENTER..." ;;
+            4) eliminar_zona; read -p "PRESIONE ENTER..." ;;
+            5) listar_zonas; read -p "PRESIONE ENTER..." ;;
+            6) reiniciar_servicio_dns; read -p "PRESIONE ENTER..." ;;
+            7) return ;;
+            *) echo "OPCION INVALIDA"; sleep 1 ;;
+        esac
+    done
+}

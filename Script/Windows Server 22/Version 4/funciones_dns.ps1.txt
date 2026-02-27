@@ -1,0 +1,200 @@
+if (-not (Get-Command "Validar-IP" -ErrorAction SilentlyContinue)) {
+    . "$PSScriptRoot\funciones_compartidas.ps1"
+}
+
+function Verificar-DNS {
+    Write-Host ""
+    Write-Host "--- VERIFICANDO DNS ---"
+    $dnsServer = Get-WindowsFeature -Name DNS
+    if ($dnsServer.Installed) {
+        Write-Host "[OK] DNS SERVER INSTALADO"
+        $dnsService = Get-Service -Name DNS -ErrorAction SilentlyContinue
+        if ($dnsService -and $dnsService.Status -eq "Running") {
+            Write-Host "     ACTIVO"
+        } else {
+            Write-Host "     INACTIVO"
+        }
+    } else {
+        Write-Host "[X] DNS SERVER NO INSTALADO"
+    }
+}
+
+function Instalar-DNS {
+    Write-Host "INSTALANDO SERVIDOR DNS..."
+    try {
+        Install-WindowsFeature -Name DNS -IncludeManagementTools
+        Set-Service -Name DNS -StartupType Automatic
+        Start-Service -Name DNS
+        Write-Host "INSTALACION DNS COMPLETADA."
+    } catch {
+        Write-Host "ERROR EN LA INSTALACION DNS: $_"
+    }
+}
+
+function Agregar-Zona {
+    $SERVER_IP = Obtener-IPActual
+    if (-not $SERVER_IP) { $SERVER_IP = "10.0.0.1" }
+    
+    Write-Host ""
+    Write-Host "--- AGREGAR ZONA DNS (CON IP VIRTUAL AUTOMATICA) ---"
+    Write-Host "NOTA: SE CREARA AUTOMATICAMENTE UNA IP VIRTUAL"
+    
+    $dominio = Read-Host "NOMBRE DEL DOMINIO"
+    if ($dominio -eq "") { return }
+    
+    do {
+        $virtualIP = Read-Host "IP VIRTUAL PARA $dominio"
+        $ipValida = Validar-IP $virtualIP
+        if (-not $ipValida) { Write-Host "IP INVALIDA O PROHIBIDA." }
+    } while (-not $ipValida)
+    
+    if ($virtualIP -eq $SERVER_IP) {
+        Write-Host "ERROR: NO PUEDES USAR LA IP DEL SERVIDOR ($SERVER_IP) COMO IP VIRTUAL"
+        return
+    }
+    
+    Write-Host ""
+    Write-Host "PASO 1: CREANDO IP VIRTUAL"
+    if (-not (Crear-IPVirtual $virtualIP $INTERFACE)) {
+        Write-Host "ERROR CRITICO: NO SE PUDO CREAR LA IP VIRTUAL. ABORTANDO."
+        return
+    }
+    
+    Write-Host ""
+    Write-Host "PASO 2: CONFIGURANDO ZONA DNS"
+    
+    try {
+        # VERIFICAR SI LA ZONA YA EXISTE
+        $existingZone = Get-DnsServerZone -Name $dominio -ErrorAction SilentlyContinue
+        if ($existingZone) {
+            Write-Host "LA ZONA YA EXISTE."
+            $rec = Read-Host "RECREAR? (S/N)"
+            if ($rec -eq "s") {
+                Remove-DnsServerZone -Name $dominio -Force
+            } else {
+                return
+            }
+        }
+        
+        Add-DnsServerPrimaryZone -Name $dominio -ZoneFile "$dominio.dns" -DynamicUpdate None
+        
+        # REGISTROS DEL DOMINIO
+        Add-DnsServerResourceRecordA -Name "@" -ZoneName $dominio -IPv4Address $virtualIP
+        Add-DnsServerResourceRecordA -Name "www" -ZoneName $dominio -IPv4Address $virtualIP
+        Add-DnsServerResourceRecordA -Name "mail" -ZoneName $dominio -IPv4Address $virtualIP
+        Add-DnsServerResourceRecordA -Name "ftp" -ZoneName $dominio -IPv4Address $virtualIP
+        Add-DnsServerResourceRecordA -Name "ns1" -ZoneName $dominio -IPv4Address $SERVER_IP
+        Add-DnsServerResourceRecordA -Name "ns2" -ZoneName $dominio -IPv4Address $SERVER_IP
+        
+        # REGISTRO MX
+        Add-DnsServerResourceRecordMX -Name "@" -ZoneName $dominio -MailExchange "mail.$dominio" -Preference 10
+        
+        Write-Host ""
+        Write-Host "PASO 3: VERIFICANDO CONFIGURACION DNS"
+        
+        Write-Host ""
+        Write-Host "PASO 4: REINICIANDO SERVICIO DNS"
+        Restart-Service -Name DNS -Force
+        
+        Write-Host ""
+        Write-Host "CONFIGURACION COMPLETADA EXITOSAMENTE"
+        Write-Host "========================================"
+        Write-Host "  DOMINIO:        $dominio"
+        Write-Host "  IP VIRTUAL:     $virtualIP"
+        Write-Host "  SERVIDOR DNS:   $SERVER_IP"
+        Write-Host "  INTERFAZ:       $INTERFACE"
+        Write-Host "========================================"
+    } catch {
+        Write-Host "ERROR AL CONFIGURAR DNS: $_"
+    }
+}
+
+function Eliminar-Zona {
+    Write-Host ""
+    Write-Host "--- ELIMINAR ZONA DNS ---"
+    
+    $zonas = Get-DnsServerZone | Where-Object { $_.ZoneName -notin "RootHints", "..msdcs", "TrustAnchors" }
+    if ($zonas) {
+        Write-Host "ZONAS ACTUALES:"
+        $zonas | ForEach-Object { Write-Host "  $($_.ZoneName)" }
+        
+        $zonaDel = Read-Host "NOMBRE EXACTO DE LA ZONA A BORRAR"
+        if ($zonaDel -eq "") { return }
+        
+        $zona = Get-DnsServerZone -Name $zonaDel -ErrorAction SilentlyContinue
+        if ($zona) {
+            # BUSCAR IP VIRTUAL ASOCIADA (OPCIONAL)
+            $records = Get-DnsServerResourceRecord -ZoneName $zonaDel -RRType A -ErrorAction SilentlyContinue
+            $recordA = $records | Where-Object { $_.HostName -eq "@" -or $_.HostName -eq $zonaDel }
+            if ($recordA) {
+                $virtualIP = $recordA.RecordData.IPv4Address
+                if ($virtualIP) {
+                    Write-Host "ELIMINANDO IP VIRTUAL ASOCIADA: $virtualIP"
+                    Eliminar-IPVirtual $virtualIP $INTERFACE
+                }
+            }
+            
+            Remove-DnsServerZone -Name $zonaDel -Force
+            Write-Host "ZONA ELIMINADA."
+        } else {
+            Write-Host "ZONA NO ENCONTRADA."
+        }
+    } else {
+        Write-Host "NO HAY ZONAS CONFIGURADAS."
+    }
+}
+
+function Listar-Zonas {
+    Write-Host ""
+    Write-Host "--- DOMINIOS CONFIGURADOS ---"
+    $zonas = Get-DnsServerZone | Where-Object { $_.ZoneName -notin "RootHints", "..msdcs", "TrustAnchors" }
+    if ($zonas) {
+        $zonas | ForEach-Object { 
+            $dominio = $_.ZoneName
+            $recordA = Get-DnsServerResourceRecord -ZoneName $dominio -RRType A -ErrorAction SilentlyContinue | Where-Object { $_.HostName -eq "@" }
+            if ($recordA) {
+                Write-Host "  - $dominio -> $($recordA.RecordData.IPv4Address)"
+            } else {
+                Write-Host "  - $dominio"
+            }
+        }
+    } else {
+        Write-Host "NO HAY ZONAS CONFIGURADAS."
+    }
+}
+
+function submenu_dns {
+    while ($true) {
+        Clear-Host
+        Write-Host ""
+        Write-Host "========================================"
+        Write-Host "   GESTION DE DNS (SERVIDOR WINDOWS)   "
+        Write-Host "========================================"
+        Write-Host "1) AGREGAR ZONA (DOMINIO)"
+        Write-Host "2) ELIMINAR ZONA"
+        Write-Host "3) LISTAR ZONAS CONFIGURADAS"
+        Write-Host "4) VOLVER AL MENU PRINCIPAL"
+        Write-Host "========================================"
+        
+        $op = Read-Host "SELECCIONE OPCION"
+        switch ($op) {
+            "1" { 
+                Agregar-Zona
+                Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+            }
+            "2" { 
+                Eliminar-Zona
+                Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+            }
+            "3" { 
+                Listar-Zonas
+                Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+            }
+            "4" { return }
+            default { 
+                Write-Host "OPCION INVALIDA"
+                Start-Sleep 1
+            }
+        }
+    }
+}

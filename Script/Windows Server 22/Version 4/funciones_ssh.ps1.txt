@@ -1,0 +1,339 @@
+if (-not (Get-Command "Validar-IP" -ErrorAction SilentlyContinue)) {
+    . "$PSScriptRoot\funciones_compartidas.ps1"
+}
+
+function Verificar-SSH {
+    Write-Host ""
+    Write-Host "--- VERIFICANDO SERVICIO SSH (WINDOWS) ---"
+    
+    $sshCapability = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Server*' }
+    if ($sshCapability.State -eq 'Installed') {
+        Write-Host "[OK] OPENSSH SERVER INSTALADO"
+    } else {
+        Write-Host "[X] OPENSSH SERVER NO INSTALADO"
+    }
+    
+    $sshService = Get-Service -Name sshd -ErrorAction SilentlyContinue
+    if ($sshService) {
+        if ($sshService.Status -eq "Running") {
+            Write-Host "[OK] SERVICIO SSH ACTIVO"
+            
+            # MOSTRAR EN QUE IPS ESTA ESCUCHANDO
+            Write-Host ""
+            Write-Host "CONFIGURACION ACTUAL DE ESCUCHA SSH:"
+            $configFile = "$env:ProgramData\ssh\sshd_config"
+            if (Test-Path $configFile) {
+                $listenAddresses = Select-String -Path $configFile -Pattern "^ListenAddress" | ForEach-Object { $_ -replace "ListenAddress ", "    " }
+                if ($listenAddresses) {
+                    $listenAddresses | Write-Host
+                } else {
+                    Write-Host "    ESCUCHANDO EN TODAS LAS INTERFACES (0.0.0.0)"
+                }
+            }
+            
+            # VERIFICAR PUERTO 22
+            Write-Host ""
+            Write-Host "PUERTOS SSH ACTIVOS:"
+            netstat -an | Select-String ":22.*LISTENING" | ForEach-Object { Write-Host "    $_" }
+        } else {
+            Write-Host "[X] SERVICIO SSH INACTIVO"
+        }
+    } else {
+        Write-Host "[X] SERVICIO SSH NO ENCONTRADO"
+    }
+    
+    # VERIFICAR HABILITACION EN ARRANQUE
+    if ($sshService -and $sshService.StartType -eq "Automatic") {
+        Write-Host "[OK] SSH HABILITADO EN EL ARRANQUE"
+    } else {
+        Write-Host "[X] SSH NO ESTA HABILITADO EN EL ARRANQUE"
+        Write-Host "  PARA HABILITAR: SET-SERVICE -NAME SSHD -STARTUPTYPE 'AUTOMATIC'"
+    }
+}
+
+function Instalar-SSH-Exclusivo {
+    Write-Host ""
+    Write-Host "--- INSTALACION DE SSH CON PUERTO EXCLUSIVO ---"
+    
+    # PASO 1: SELECCIONAR INTERFAZ SSH
+    $resultado = Seleccionar-InterfazSSHExclusiva
+    if (-not $resultado -or -not $global:SSH_INTERFACE_EXCLUSIVA -or -not $global:SSH_IP_EXCLUSIVA) {
+        Write-Host "ERROR: NO SE PUDO CONFIGURAR LA INTERFAZ SSH EXCLUSIVA"
+        Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+        return $false
+    }
+    
+    # PASO 2: VERIFICAR CONECTIVIDAD BASICA
+    Write-Host ""
+    Write-Host "VERIFICANDO CONECTIVIDAD DE LA INTERFAZ..."
+    try {
+        if (Test-Connection -ComputerName $global:SSH_IP_EXCLUSIVA -Count 1 -Quiet) {
+            Write-Host "OK: LA IP $($global:SSH_IP_EXCLUSIVA) RESPONDE A PING"
+        } else {
+            Write-Host "ADVERTENCIA: LA IP $($global:SSH_IP_EXCLUSIVA) NO RESPONDE A PING"
+            Write-Host "ESTO PUEDE SER NORMAL SI ES UNA IP NUEVA"
+        }
+    } catch {
+        Write-Host "NO SE PUDO VERIFICAR CONECTIVIDAD"
+    }
+    
+    # PASO 3: PREGUNTAR SI CONTINUAR
+    $continuar = Read-Host "CONTINUAR CON LA INSTALACION DE SSH EN $($global:SSH_IP_EXCLUSIVA)? (S/N)"
+    if ($continuar -ne "s") {
+        Write-Host "INSTALACION CANCELADA."
+        return
+    }
+    
+    # PASO 4: INSTALAR OPENSSH SERVER
+    Write-Host ""
+    Write-Host "INSTALANDO OPENSSH-SERVER..."
+    try {
+        Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+        Write-Host "INSTALACION SSH COMPLETADA."
+    } catch {
+        Write-Host "ERROR EN LA INSTALACION DE SSH: $_"
+        return $false
+    }
+    
+    # PASO 5: BACKUP CONFIGURACION
+    $configDir = "$env:ProgramData\ssh"
+    $configFile = "$configDir\sshd_config"
+    $backupFile = "$configDir\sshd_config.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    
+    if (Test-Path $configFile) {
+        Copy-Item $configFile $backupFile
+        Write-Host "BACKUP CREADO: $backupFile"
+    }
+    
+    # PASO 6: CONFIGURAR SSH PARA ESCUCHA EXCLUSIVA
+    Write-Host ""
+    Write-Host "CONFIGURANDO SSH PARA ESCUCHAR SOLO EN $($global:SSH_IP_EXCLUSIVA)..."
+    
+    # CREAR DIRECTORIO SI NO EXISTE
+    if (-not (Test-Path $configDir)) {
+        New-Item -ItemType Directory -Path $configDir -Force
+    }
+    
+    # LEER CONFIGURACION EXISTENTE
+    $configLines = @()
+    if (Test-Path $configFile) {
+        $configLines = Get-Content $configFile
+    }
+    
+    # FILTRAR LINEAS ListenAddress EXISTENTES Y AGREGAR COMENTARIO
+    $newConfig = @()
+    $newConfig += "# CONFIGURACION PARA PUERTO EXCLUSIVO SSH"
+    $newConfig += "# GENERADO: $(Get-Date)"
+    $newConfig += "ListenAddress $($global:SSH_IP_EXCLUSIVA)"
+    $newConfig += "PasswordAuthentication yes"
+    
+    # AGREGAR RESTO DE CONFIGURACION (EXCLUYENDO ListenAddress EXISTENTES)
+    foreach ($line in $configLines) {
+        if ($line -notmatch '^ListenAddress' -and $line -notmatch '^PasswordAuthentication') {
+            $newConfig += $line
+        }
+    }
+    
+    # GUARDAR CONFIGURACION
+    $newConfig | Set-Content $configFile
+    Write-Host "CONFIGURACION APLICADA: SSH ESCUCHARA SOLO EN $($global:SSH_IP_EXCLUSIVA)"
+    
+    # PASO 7: HABILITAR EN ARRANQUE
+    Write-Host ""
+    Write-Host "HABILITANDO SSH EN EL ARRANQUE..."
+    Set-Service -Name sshd -StartupType Automatic
+    
+    # PASO 8: CONFIGURAR FIREWALL
+    Write-Host ""
+    Write-Host "CONFIGURANDO FIREWALL PARA SSH (PUERTO 22 EN $($global:SSH_IP_EXCLUSIVA))..."
+    try {
+        # ELIMINAR REGLAS EXISTENTES
+        Get-NetFirewallRule -DisplayName "SSH" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+        Get-NetFirewallRule -DisplayName "OpenSSH Server" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+        Get-NetFirewallRule -DisplayName "SSH Exclusivo" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+        
+        # CREAR NUEVA REGLA
+        New-NetFirewallRule -DisplayName "SSH Exclusivo" -Direction Inbound -Protocol TCP -LocalPort 22 -RemoteAddress Any -Action Allow | Out-Null
+        Write-Host "REGLAS DE FIREWALL AGREGADAS"
+    } catch {
+        Write-Host "ERROR AL CONFIGURAR FIREWALL: $_"
+    }
+    
+    # PASO 9: CONFIGURAR PERMISOS
+    Write-Host ""
+    Write-Host "CONFIGURANDO PERMISOS..."
+    
+    # CREAR DIRECTORIO .SSH PARA EL USUARIO ACTUAL
+    $userSshDir = "$env:USERPROFILE\.ssh"
+    if (-not (Test-Path $userSshDir)) {
+        New-Item -ItemType Directory -Path $userSshDir -Force
+    }
+    
+    # PASO 10: REINICIAR SSH
+    Write-Host ""
+    Write-Host "REINICIANDO SERVICIO SSH..."
+    Stop-Service sshd -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Start-Service sshd
+    Start-Sleep -Seconds 3
+    
+    # PASO 11: VERIFICAR
+    Write-Host ""
+    Write-Host "VERIFICANDO CONFIGURACION FINAL..."
+    $sshService = Get-Service -Name sshd
+    if ($sshService.Status -eq "Running") {
+        Write-Host "SERVICIO SSH ACTIVO"
+        
+        # MOSTRAR EN QUE IP ESCUCHA
+        Write-Host ""
+        Write-Host "SSH ESTA ESCUCHANDO EN:"
+        netstat -an | Select-String ":22.*LISTENING" | ForEach-Object { Write-Host "    $_" }
+        
+        # MOSTRAR INSTRUCCIONES
+        Write-Host ""
+        Write-Host "================================================"
+        Write-Host "SSH CONFIGURADO EXITOSAMENTE"
+        Write-Host "================================================"
+        Write-Host "INTERFAZ EXCLUSIVA: $($global:SSH_INTERFACE_EXCLUSIVA)"
+        Write-Host "IP EXCLUSIVA:       $($global:SSH_IP_EXCLUSIVA)"
+        Write-Host "USUARIO:            $env:USERNAME"
+        Write-Host ""
+        Write-Host "PARA CONECTARTE DESDE POWERSHELL/LINUX:"
+        Write-Host "  ssh $env:USERNAME@$($global:SSH_IP_EXCLUSIVA)"
+        Write-Host ""
+        Write-Host "IMPORTANTE - SEGURIDAD:"
+        Write-Host "• NO MODIFIQUES LA IP $($global:SSH_IP_EXCLUSIVA) mientras estes conectado"
+        Write-Host "• Para cambios en otras interfaces, NO REINICIES LA RED COMPLETA"
+        Write-Host "================================================"
+    } else {
+        Write-Host "ERROR: EL SERVICIO SSH NO ARRANCO"
+        Get-EventLog -LogName System -Source sshd -Newest 10 | Format-Table -AutoSize
+    }
+}
+
+function Instalar-SSH {
+    Write-Host ""
+    Write-Host "--- INSTALAR SSH (CONFIGURACION BASICA) ---"
+    $confirmar = Read-Host "CONTINUAR? (S/N)"
+    if ($confirmar -ne "s") { return }
+    try {
+        Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+        Set-Service -Name sshd -StartupType 'Automatic'
+        Start-Service sshd
+        New-NetFirewallRule -DisplayName "SSH" -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -ErrorAction SilentlyContinue
+        Write-Host "SSH INSTALADO"
+        $SERVER_IP = Obtener-IPActual
+        Write-Host "COMANDO: ssh $env:USERNAME@$SERVER_IP"
+    } catch {
+        Write-Host "ERROR: $_"
+    }
+}
+
+function Verificar-ConexionSegura {
+    Write-Host ""
+    Write-Host "--- VERIFICACION DE CONEXION SSH SEGURA ---"
+    
+    if ($global:SSH_IP_EXCLUSIVA) {
+        Write-Host "IP SSH EXCLUSIVA: $($global:SSH_IP_EXCLUSIVA)"
+        
+        # VERIFICAR QUE LA IP SIGUE ACTIVA
+        $ipInfo = Get-NetIPAddress -IPAddress $global:SSH_IP_EXCLUSIVA -ErrorAction SilentlyContinue
+        if ($ipInfo) {
+            Write-Host "INTERFAZ: $($ipInfo.InterfaceAlias) - ACTIVA"
+        } else {
+            Write-Host "ADVERTENCIA: LA IP $($global:SSH_IP_EXCLUSIVA) NO ESTA CONFIGURADA"
+        }
+        
+        # VERIFICAR REGLAS DE FIREWALL
+        $firewallRule = Get-NetFirewallRule -DisplayName "SSH Exclusivo" -ErrorAction SilentlyContinue
+        if ($firewallRule) {
+            Write-Host "FIREWALL: REGLA ACTIVA (SSH Exclusivo)"
+        } else {
+            Write-Host "FIREWALL: REGLA NO ENCONTRADA"
+        }
+    } else {
+        Write-Host "NO SE DETECTO CONFIGURACION DE IP EXCLUSIVA"
+        Write-Host "SSH ESTA ESCUCHANDO EN TODAS LAS INTERFACES"
+        
+        $configFile = "$env:ProgramData\ssh\sshd_config"
+        if (Test-Path $configFile) {
+            $listenAddress = Select-String -Path $configFile -Pattern "^ListenAddress" | Select-Object -First 1
+            if ($listenAddress) {
+                Write-Host "CONFIGURACION ACTUAL: $($listenAddress.Line)"
+            }
+        }
+    }
+}
+
+function Generar-Instrucciones {
+    $SERVER_IP = Obtener-IPActual
+    Write-Host ""
+    Write-Host "--- INSTRUCCIONES PARA CLIENTES ---"
+    Write-Host ""
+    Write-Host "PARA CONECTARTE DESDE LINUX/MAC:"
+    Write-Host "  ssh $env:USERNAME@$SERVER_IP"
+    Write-Host ""
+    Write-Host "PARA CONECTARTE DESDE WINDOWS (POWERSHELL):"
+    Write-Host "  ssh $env:USERNAME@$SERVER_IP"
+    Write-Host ""
+    
+    if ($global:SSH_IP_EXCLUSIVA) {
+        Write-Host "SI CONFIGURASTE PUERTO EXCLUSIVO:"
+        Write-Host "  ssh $env:USERNAME@$($global:SSH_IP_EXCLUSIVA)"
+        Write-Host ""
+    }
+    
+    Write-Host "PARA COPIAR ARCHIVOS (SCP):"
+    Write-Host "  scp archivo.txt $env:USERNAME@$SERVER_IP`:/ruta/destino/"
+    Write-Host ""
+    Write-Host "PARA GENERAR PAR DE CLAVES:"
+    Write-Host "  ssh-keygen -t ed25519"
+    Write-Host "  ssh-copy-id $env:USERNAME@$SERVER_IP"
+}
+
+function submenu_ssh {
+    while ($true) {
+        Clear-Host
+        Write-Host ""
+        Write-Host "========================================"
+        Write-Host "   GESTION DE SSH (ACCESO REMOTO)      "
+        Write-Host "   CON SOPORTE PARA PUERTO EXCLUSIVO   "
+        Write-Host "========================================"
+        Write-Host "1) VERIFICAR ESTADO DE SSH"
+        Write-Host "2) CONFIGURAR PUERTO EXCLUSIVO PARA SSH (NUEVO)"
+        Write-Host "3) INSTALAR SSH CONFIGURACION BASICA"
+        Write-Host "4) VER INSTRUCCIONES"
+        Write-Host "5) VERIFICAR CONEXION SEGURA"
+        Write-Host "6) VOLVER AL MENU PRINCIPAL"
+        Write-Host "========================================"
+        
+        $op = Read-Host "SELECCIONE OPCION"
+        switch ($op) {
+            "1" { 
+                Verificar-SSH
+                Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+            }
+            "2" { 
+                Instalar-SSH-Exclusivo
+                Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+            }
+            "3" { 
+                Instalar-SSH
+                Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+            }
+            "4" { 
+                Generar-Instrucciones
+                Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+            }
+            "5" { 
+                Verificar-ConexionSegura
+                Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+            }
+            "6" { return }
+            default { 
+                Write-Host "OPCION INVALIDA"
+                Start-Sleep 1
+            }
+        }
+    }
+}

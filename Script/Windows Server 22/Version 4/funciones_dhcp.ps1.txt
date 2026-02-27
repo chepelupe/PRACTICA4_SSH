@@ -1,0 +1,82 @@
+if (-not (Get-Command "Validar-IP" -ErrorAction SilentlyContinue)) {
+    . "$PSScriptRoot\funciones_compartidas.ps1"
+}
+
+function Verificar-DHCP {
+    Write-Host ""
+    Write-Host "--- VERIFICANDO DHCP ---"
+    $dhcpServer = Get-WindowsFeature -Name DHCP
+    if ($dhcpServer.Installed) {
+        Write-Host "[OK] DHCP SERVER INSTALADO"
+        $dhcpService = Get-Service -Name DHCPServer -ErrorAction SilentlyContinue
+        if ($dhcpService -and $dhcpService.Status -eq "Running") {
+            Write-Host "      ACTIVO"
+        } else {
+            Write-Host "      INACTIVO"
+        }
+    } else {
+        Write-Host "[X] DHCP SERVER NO INSTALADO"
+    }
+}
+
+function Instalar-DHCP {
+    Write-Host "INSTALANDO SERVIDOR DHCP..."
+    try {
+        Install-WindowsFeature -Name DHCP -IncludeManagementTools
+        Set-Service -Name DHCPServer -StartupType Automatic
+        Write-Host "INSTALACION DHCP COMPLETADA."
+    } catch {
+        Write-Host "ERROR EN LA INSTALACION DHCP: $_"
+    }
+}
+
+function Configurar-DHCP {
+    $SERVER_IP = Obtener-IPActual
+    if (-not $SERVER_IP) {
+        Write-Host "ALERTA: CONFIGURA LA IP ESTATICA PRIMERO."
+        return
+    }
+    
+    Write-Host ""
+    Write-Host "--- CONFIGURAR SERVIDOR DHCP ---"
+    $scopeName = Read-Host "NOMBRE DEL AMBITO DHCP"
+    
+    do {
+        $ipIni = Read-Host "IP INICIAL DEL RANGO"
+        $ipIniValida = Validar-IP $ipIni
+        if (-not $ipIniValida) { Write-Host "IP INVALIDA O PROHIBIDA." }
+    } while (-not $ipIniValida)
+    
+    do {
+        $ipFin = Read-Host "IP FINAL DEL RANGO"
+        $ipFinValida = Validar-IP $ipFin
+        if (-not $ipFinValida) { Write-Host "IP INVALIDA O PROHIBIDA." }
+    } while (-not $ipFinValida)
+    
+    $gateway = Read-Host "GATEWAY PARA CLIENTES (ENTER PARA OMITIR)"
+    if ($gateway) {
+        if (-not (Validar-IP $gateway)) {
+            Write-Host "GATEWAY INVALIDO, OMITIENDO"
+            $gateway = ""
+        }
+    }
+    
+    $leaseTime = Read-Host "TIEMPO CONCESION (SEGUNDOS) [ENTER=86400]"
+    if ($leaseTime -eq "") { $leaseTime = 86400 }
+    
+    $subnet = ($SERVER_IP -split '\.')[0..2] -join '.' + ".0"
+    
+    Write-Host "GENERANDO CONFIGURACION DHCP..."
+    
+    try {
+        Add-DhcpServerv4Scope -Name $scopeName -StartRange $ipIni -EndRange $ipFin -SubnetMask 255.255.255.0 -State Active
+        if ($gateway) { 
+            Set-DhcpServerv4OptionValue -ScopeId $subnet -OptionId 3 -Value $gateway 
+        }
+        Set-DhcpServerv4OptionValue -ScopeId $subnet -OptionId 6 -Value $SERVER_IP
+        
+        Write-Host ">>> SERVIDOR DHCP CONFIGURADO CORRECTAMENTE <<<"
+    } catch {
+        Write-Host "ERROR AL CONFIGURAR DHCP: $_"
+    }
+}

@@ -1,0 +1,294 @@
+$SCRIPT_DIR = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+Write-Host "CARGANDO MODULOS DESDE: $SCRIPT_DIR"
+
+if (Test-Path "$SCRIPT_DIR\funciones_compartidas.ps1") {
+    . "$SCRIPT_DIR\funciones_compartidas.ps1"
+    Write-Host "MODULO FUNCIONES_COMPARTIDAS.PS1 CARGADO"
+} else { 
+    Write-Host "ERROR: NO SE ENCUENTRA FUNCIONES_COMPARTIDAS.PS1"
+    exit 1 
+}
+
+if (Test-Path "$SCRIPT_DIR\funciones_dhcp.ps1") {
+    . "$SCRIPT_DIR\funciones_dhcp.ps1"
+    Write-Host "MODULO FUNCIONES_DHCP.PS1 CARGADO"
+} else { 
+    Write-Host "ERROR: NO SE ENCUENTRA FUNCIONES_DHCP.PS1"
+    exit 1 
+}
+
+if (Test-Path "$SCRIPT_DIR\funciones_dns.ps1") {
+    . "$SCRIPT_DIR\funciones_dns.ps1"
+    Write-Host "MODULO FUNCIONES_DNS.PS1 CARGADO"
+} else { 
+    Write-Host "ERROR: NO SE ENCUENTRA FUNCIONES_DNS.PS1"
+    exit 1 
+}
+
+if (Test-Path "$SCRIPT_DIR\funciones_ssh.ps1") {
+    . "$SCRIPT_DIR\funciones_ssh.ps1"
+    Write-Host "MODULO FUNCIONES_SSH.PS1 CARGADO (CON PUERTO EXCLUSIVO)"
+} else { 
+    Write-Host "ERROR: NO SE ENCUENTRA FUNCIONES_SSH.PS1"
+    exit 1 
+}
+
+Start-Sleep -Seconds 2
+
+# =========================
+# FUNCIONES ADICIONALES
+# =========================
+
+function Instalar-Todo {
+    Write-Host ""
+    Write-Host "--- INSTALANDO TODOS LOS ROLES ---"
+    
+    if (Get-Command "Instalar-DHCP" -ErrorAction SilentlyContinue) {
+        Instalar-DHCP
+    } else {
+        Write-Host "ERROR: FUNCION Instalar-DHCP NO DISPONIBLE"
+    }
+    
+    if (Get-Command "Instalar-DNS" -ErrorAction SilentlyContinue) {
+        Instalar-DNS
+    } else {
+        Write-Host "ERROR: FUNCION Instalar-DNS NO DISPONIBLE"
+    }
+    
+    if (Get-Command "Instalar-SSH" -ErrorAction SilentlyContinue) {
+        Instalar-SSH
+    } else {
+        Write-Host "ERROR: FUNCION Instalar-SSH NO DISPONIBLE"
+    }
+    
+    if (Get-Command "Configurar-FirewallPing" -ErrorAction SilentlyContinue) {
+        Configurar-FirewallPing
+    }
+    
+    Write-Host ""
+    Write-Host "INSTALACION DE TODOS LOS ROLES COMPLETADA"
+}
+
+function Configurar-IPEstatica {
+    if (-not $INTERFACE) {
+        Write-Host ""
+        Write-Host "PRIMERO DEBES SELECCIONAR UNA INTERFAZ"
+        Seleccionar-Interfaz
+    }
+    
+    $CURRENT_IP = Obtener-IPActual
+    Write-Host ""
+    Write-Host "--- CONFIGURACION IP ESTATICA ($INTERFACE) ---"
+    Write-Host "IP ACTUAL: $(if ($CURRENT_IP) { $CURRENT_IP } else { 'NINGUNA' })"
+    
+    $resp = Read-Host "CONFIGURAR IP ESTATICA NUEVA? (S/N)"
+    if ($resp -eq "s") {
+        do {
+            $nueva_ip = Read-Host "INGRESE IP ESTATICA"
+            $ip_valida = Validar-IP $nueva_ip
+            if (-not $ip_valida) {
+                Write-Host "IP INVALIDA O PROHIBIDA."
+            }
+        } while (-not $ip_valida)
+
+        Write-Host "APLICANDO CONFIGURACION..."
+        
+        # ELIMINAR IP EXISTENTE
+        $existingIP = Get-NetIPAddress -InterfaceAlias $INTERFACE -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        if ($existingIP) {
+            Remove-NetIPAddress -InterfaceAlias $INTERFACE -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        
+        # AGREGAR NUEVA IP
+        try {
+            New-NetIPAddress -InterfaceAlias $INTERFACE -IPAddress $nueva_ip -PrefixLength 24 -ErrorAction Stop
+            Write-Host "IP $nueva_ip ASIGNADA A $INTERFACE"
+        } catch {
+            Write-Host "ERROR AL CONFIGURAR IP: $_"
+        }
+        
+        Write-Host ""
+        Write-Host "NOTA: ESTA CONFIGURACION ES TEMPORAL"
+        Write-Host "PARA HACERLA PERMANENTE, CONFIGURA EN EL PANEL DE RED"
+    }
+}
+
+function Verificar-Todo {
+    Write-Host ""
+    Write-Host "--- VERIFICACION COMPLETA DEL SISTEMA ---"
+    
+    # VERIFICAR INTERFAZ
+    Write-Host ""
+    Write-Host "INTERFAZ PRINCIPAL: $(if ($INTERFACE) { $INTERFACE } else { 'NO DEFINIDA' })"
+    
+    # VERIFICAR IPS
+    Write-Host ""
+    Write-Host "TODAS LAS INTERFACES DE RED:"
+    Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -ne "Loopback" } | ForEach-Object {
+        Write-Host "  $($_.InterfaceAlias): $($_.IPAddress)"
+    }
+    
+    # VERIFICAR SERVICIOS
+    Write-Host ""
+    Write-Host "ESTADO DE SERVICIOS:"
+    
+    if (Get-Command "Verificar-DHCP" -ErrorAction SilentlyContinue) {
+        Verificar-DHCP
+    }
+    if (Get-Command "Verificar-DNS" -ErrorAction SilentlyContinue) {
+        Verificar-DNS
+    }
+    if (Get-Command "Verificar-SSH" -ErrorAction SilentlyContinue) {
+        Verificar-SSH
+    }
+}
+
+function Info-Clientes {
+    $SERVER_IP = Obtener-IPActual
+    Write-Host ""
+    Write-Host "--- INFORMACION PARA CLIENTES ---"
+    Write-Host ""
+    Write-Host "IP DEL SERVIDOR: $SERVER_IP"
+    Write-Host "USUARIO: $env:USERNAME"
+    Write-Host ""
+    Write-Host "COMANDOS DE CONEXION:"
+    Write-Host "  SSH: ssh $env:USERNAME@$SERVER_IP"
+    Write-Host "  RDP: mstsc /v:$SERVER_IP"
+    Write-Host ""
+    
+    if ($global:SSH_IP_EXCLUSIVA) {
+        Write-Host "PUERTO EXCLUSIVO SSH:"
+        Write-Host "  ssh $env:USERNAME@$global:SSH_IP_EXCLUSIVA"
+    }
+}
+
+# =========================
+# VERIFICACION INICIAL
+# =========================
+
+Clear-Host
+Check-Administrator
+
+Write-Host "================================================"
+Write-Host "   GESTOR DE INFRAESTRUCTURA - WINDOWS 2022   "
+Write-Host "   CON SOPORTE PARA PUERTO EXCLUSIVO SSH      "
+Write-Host "================================================"
+Write-Host ""
+Write-Host "CARACTERISTICAS:"
+Write-Host "  • SOPORTE PARA PUERTO EXCLUSIVO SSH"
+Write-Host "  • CONFIGURACION DHCP Y DNS"
+Write-Host "  • GESTION DE IPS VIRTUALES"
+Write-Host ""
+Write-Host "NOTA: PARA CONFIGURAR SSH EN PUERTO EXCLUSIVO:"
+Write-Host "  MENU PRINCIPAL → OPCION 6 → OPCION 2"
+Write-Host ""
+Write-Host "SISTEMA: WINDOWS SERVER 2022"
+Write-Host ""
+
+$sel_interfaz = Read-Host "SELECCIONAR INTERFAZ INTERNA AHORA? (S/N)"
+if ($sel_interfaz -eq "s") {
+    Seleccionar-Interfaz
+    $IP_ACTUAL = Obtener-IPActual
+    Write-Host "IP PRINCIPAL: $(if ($IP_ACTUAL) { $IP_ACTUAL } else { 'NO CONFIGURADA' })"
+} else {
+    Write-Host "NOTA: PUEDES SELECCIONAR LA INTERFAZ DESPUES"
+    Write-Host "      DESDE LA OPCION DE CONFIGURACION"
+}
+
+Write-Host ""
+Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+
+# =========================
+# MENU PRINCIPAL
+# =========================
+
+while ($true) {
+    Clear-Host
+    $IP_ACTUAL = Obtener-IPActual
+    if (-not $IP_ACTUAL) { $IP_ACTUAL = "NO CONFIGURADA" }
+    
+    Write-Host "==============================================="
+    Write-Host "   GESTOR DE INFRAESTRUCTURA - VERSION 6.1   "
+    Write-Host "   (WINDOWS SERVER 2022)                      "
+    Write-Host "==============================================="
+    Write-Host "INTERFAZ INTERNA:   $(if ($INTERFACE) { $INTERFACE } else { 'NO DEFINIDA' })"
+    Write-Host "IP PRINCIPAL:       $IP_ACTUAL"
+    Write-Host "==============================================="
+    Write-Host ""
+    Write-Host "  1)  VERIFICAR INSTALACION COMPLETA"
+    Write-Host "  2)  INSTALAR TODOS LOS ROLES"
+    Write-Host ""
+    Write-Host "  --- CONFIGURACION DE RED ---"
+    Write-Host "  3)  CONFIGURAR IP ESTATICA"
+    Write-Host ""
+    Write-Host "  --- SERVICIOS ---"
+    Write-Host "  4)  CONFIGURAR SERVIDOR DHCP"
+    Write-Host "  5)  GESTION DE DOMINIOS DNS"
+    Write-Host "  6)  GESTION DE SSH (CON PUERTO EXCLUSIVO)"
+    Write-Host ""
+    Write-Host "  --- UTILIDADES ---"
+    Write-Host "  7)  INFORMACION PARA CLIENTES"
+    Write-Host "  8)  SELECCIONAR INTERFAZ DE RED"
+    Write-Host "  9)  SALIR"
+    Write-Host ""
+    Write-Host "==============================================="
+    
+    $op = Read-Host "SELECCIONE UNA OPCION [1-9]"
+    
+    switch ($op) {
+        "1" { 
+            Verificar-Todo
+            Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+        }
+        "2" { 
+            Instalar-Todo
+            Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+        }
+        "3" { 
+            Configurar-IPEstatica
+            Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+        }
+        "4" { 
+            if (Get-Command "Configurar-DHCP" -ErrorAction SilentlyContinue) {
+                Configurar-DHCP
+            } else {
+                Write-Host "ERROR: FUNCION Configurar-DHCP NO DISPONIBLE"
+            }
+            Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+        }
+        "5" { 
+            if (Get-Command "submenu_dns" -ErrorAction SilentlyContinue) {
+                submenu_dns
+            } else {
+                Write-Host "ERROR: FUNCION submenu_dns NO DISPONIBLE"
+                Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+            }
+        }
+        "6" { 
+            if (Get-Command "submenu_ssh" -ErrorAction SilentlyContinue) {
+                submenu_ssh
+            } else {
+                Write-Host "ERROR: FUNCION submenu_ssh NO DISPONIBLE"
+                Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+            }
+        }
+        "7" { 
+            Info-Clientes
+            Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+        }
+        "8" {
+            Seleccionar-Interfaz
+            Read-Host "PRESIONE ENTER PARA CONTINUAR..."
+        }
+        "9" { 
+            Write-Host ""
+            Write-Host "HASTA LUEGO!"
+            exit 0 
+        }
+        default { 
+            Write-Host "OPCION INVALIDA"
+            Start-Sleep 1
+        }
+    }
+}
