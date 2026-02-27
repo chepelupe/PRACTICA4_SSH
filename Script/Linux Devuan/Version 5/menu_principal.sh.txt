@@ -1,0 +1,188 @@
+#!/bin/bash
+# ==============================================================================
+# MENU PRINCIPAL - VERSION FINAL (SIN RESTRICCION DE RED)
+# ==============================================================================
+
+echo "CARGANDO MODULOS..."
+
+source ./funciones_compartidas.sh
+source ./funciones_dhcp.sh
+source ./funciones_dns.sh
+source ./funciones_ssh.sh
+
+echo "TODOS LOS MODULOS CARGADOS CORRECTAMENTE."
+sleep 2
+
+# =========================
+# FUNCIONES ADICIONALES
+# =========================
+
+instalar_todos_roles() {
+    echo ""
+    echo "--- INSTALANDO TODOS LOS ROLES ---"
+    echo "ACTUALIZANDO REPOSITORIOS..."
+    apt-get update
+    
+    instalar_dhcp
+    instalar_dns
+    
+    echo ""
+    echo "INSTALACION COMPLETADA."
+    echo "USA LA OPCION 6 PARA CONFIGURAR SSH EN ETH2"
+}
+
+activar_todas_interfaces() {
+    echo ""
+    echo "--- ACTIVANDO TODAS LAS INTERFACES ---"
+    activar_interfaces_red
+    activar_eth2
+}
+
+configurar_ip_estatica() {
+    if [ -z "$INTERFACE" ] || [ "$INTERFACE" == "PENDIENTE" ]; then
+        echo ""
+        echo "PRIMERO DEBES SELECCIONAR UNA INTERFAZ"
+        seleccionar_interfaz
+    fi
+    
+    CURRENT_IP=$(obtener_ip_actual 2>/dev/null)
+    echo ""
+    echo "--- CONFIGURACION IP ESTATICA ($INTERFACE) ---"
+    echo "IP ACTUAL: ${CURRENT_IP:-NINGUNA}"
+    echo ""
+    
+    read -p "INGRESE IP ESTATICA: " nueva_ip
+    validar_ip_completa "$nueva_ip"
+    if [ $? -ne 0 ]; then
+        echo "IP INVALIDA"
+        return
+    fi
+    
+    echo "APLICANDO CONFIGURACION..."
+    ip addr flush dev $INTERFACE 2>/dev/null
+    ip addr add $nueva_ip/24 dev $INTERFACE
+    ip link set $INTERFACE up
+    
+    cat > /etc/network/interfaces <<EOF
+auto lo
+iface lo inet loopback
+
+allow-hotplug eth0
+iface eth0 inet dhcp
+
+auto $INTERFACE
+iface $INTERFACE inet static
+    address $nueva_ip
+    netmask 255.255.255.0
+EOF
+
+    echo "IP $nueva_ip ASIGNADA A $INTERFACE"
+}
+
+verificar_instalacion() {
+    echo ""
+    echo "--- VERIFICACION COMPLETA ---"
+    
+    echo ""
+    echo "INTERFACES DE RED:"
+    ip -4 addr show | grep -v "127.0.0.1" | sed 's/^/  /'
+    
+    echo ""
+    echo "SERVICIOS INSTALADOS:"
+    dpkg -s isc-dhcp-server >/dev/null 2>&1 && echo "  DHCP: INSTALADO" || echo "  DHCP: NO"
+    dpkg -s bind9 >/dev/null 2>&1 && echo "  DNS: INSTALADO" || echo "  DNS: NO"
+    dpkg -s openssh-server >/dev/null 2>&1 && echo "  SSH: INSTALADO" || echo "  SSH: NO"
+    
+    echo ""
+    echo "ESTADO DE SERVICIOS:"
+    service isc-dhcp-server status >/dev/null 2>&1 && echo "  DHCP: ACTIVO" || echo "  DHCP: INACTIVO"
+    service named status >/dev/null 2>&1 && echo "  DNS: ACTIVO" || echo "  DNS: INACTIVO"
+    service ssh status >/dev/null 2>&1 | grep -q "running" && echo "  SSH: ACTIVO" || echo "  SSH: INACTIVO"
+}
+
+mostrar_instrucciones() {
+    echo ""
+    echo "================================================"
+    echo "INSTRUCCIONES FINALES"
+    echo "================================================"
+    echo ""
+    echo "1. CONFIGURA EL ADAPTADOR 3 EN VIRTUALBOX COMO 'SOLO ANFITRION'"
+    echo ""
+    echo "2. USA OPCION 2a PARA ACTIVAR TODAS LAS INTERFACES"
+    echo ""
+    echo "3. USA OPCION 6 PARA CONFIGURAR SSH EN ETH2"
+    echo ""
+    echo "4. CONECTATE DESDE WINDOWS: ssh USUARIO@192.168.56.10"
+    echo ""
+    echo "5. CONFIGURA IP ESTATICA EN ETH1 (EJ. 10.10.10.1)"
+    echo ""
+    echo "6. INSTALA DHCP Y DNS CON OPCION 2"
+    echo ""
+    echo "7. CONFIGURA DHCP CON OPCION 4"
+    echo ""
+    echo "8. AGREGA DOMINIOS CON OPCION 5"
+    echo ""
+    echo "9. PRUEBAS:"
+    echo "   nslookup siganplaticando.com"
+    echo "   ping 10.10.10.50"
+    echo "================================================"
+}
+
+# =========================
+# VERIFICACION INICIAL
+# =========================
+
+check_root
+
+clear
+echo "================================================"
+echo "   GESTOR DE INFRAESTRUCTURA - VERSION FINAL   "
+echo "================================================"
+echo ""
+
+read -p "SELECCIONAR INTERFAZ INTERNA AHORA? (S/N): " sel_interfaz
+if [[ "$sel_interfaz" == "S" ]] || [[ "$sel_interfaz" == "s" ]]; then
+    seleccionar_interfaz
+else
+    INTERFACE="PENDIENTE"
+fi
+
+while true; do
+    clear
+    echo "==============================================="
+    echo "   MENU PRINCIPAL                              "
+    echo "==============================================="
+    echo "INTERFAZ INTERNA: ${INTERFACE:-NO DEFINIDA}"
+    echo "==============================================="
+    echo ""
+    echo "  1)  VERIFICAR INSTALACION"
+    echo "  2)  INSTALAR TODOS LOS ROLES (DHCP Y DNS)"
+    echo "  2a) ACTIVAR TODAS LAS INTERFACES (ETH1 Y ETH2)"
+    echo ""
+    echo "  3)  CONFIGURAR IP ESTATICA"
+    echo "  4)  CONFIGURAR SERVIDOR DHCP"
+    echo "  5)  GESTION DE DOMINIOS DNS"
+    echo "  6)  CONFIGURAR SSH EN ETH2"
+    echo ""
+    echo "  7)  VER INSTRUCCIONES FINALES"
+    echo "  8)  SELECCIONAR INTERFAZ"
+    echo "  9)  SALIR"
+    echo ""
+    echo "==============================================="
+    
+    read -p "SELECCIONE OPCION: " MAIN_OPC
+    
+    case $MAIN_OPC in
+        1) verificar_instalacion; read -p "PRESIONE ENTER..." ;;
+        2) instalar_todos_roles; read -p "PRESIONE ENTER..." ;;
+        2a) activar_todas_interfaces; read -p "PRESIONE ENTER..." ;;
+        3) configurar_ip_estatica; read -p "PRESIONE ENTER..." ;;
+        4) configurar_dhcp; read -p "PRESIONE ENTER..." ;;
+        5) submenu_dns ;;
+        6) submenu_ssh ;;
+        7) mostrar_instrucciones; read -p "PRESIONE ENTER..." ;;
+        8) seleccionar_interfaz; read -p "PRESIONE ENTER..." ;;
+        9) echo "HASTA LUEGO"; exit 0 ;;
+        *) echo "OPCION INVALIDA"; sleep 1 ;;
+    esac
+done

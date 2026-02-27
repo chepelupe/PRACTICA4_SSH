@@ -1,0 +1,189 @@
+#!/bin/bash
+# ==============================================================================
+# FUNCIONES COMPARTIDAS - VERSION FINAL (SIN RESTRICCION DE RED)
+# ==============================================================================
+
+# =========================
+# VARIABLES GLOBALES
+# =========================
+INTERFACE=""
+IPS_VIRTUALES=()
+
+# =========================
+# FUNCIONES DE VALIDACION
+# =========================
+
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo "ERROR: ESTE SCRIPT DEBE EJECUTARSE COMO ROOT"
+        exit 1
+    fi
+}
+
+validar_ip_sintaxis() {
+    local ip=$1
+    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        local IFS='.'
+        set -- $ip
+        if [ $1 -le 255 ] && [ $2 -le 255 ] && [ $3 -le 255 ] && [ $4 -le 255 ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+es_ip_prohibida() {
+    local ip=$1
+    if [[ "$ip" == "0.0.0.0" ]] || [[ "$ip" == "255.255.255.255" ]]; then return 0; fi
+    if [[ "$ip" == 127.* ]]; then return 0; fi
+    local first_octet=$(echo $ip | cut -d'.' -f1)
+    if (( first_octet >= 224 )); then return 0; fi
+    return 1
+}
+
+validar_ip_completa() {
+    local ip=$1
+    if validar_ip_sintaxis "$ip"; then
+        if ! es_ip_prohibida "$ip"; then
+            return 0
+        else
+            return 2
+        fi
+    else
+        return 1
+    fi
+}
+
+# =========================
+# FUNCIONES DE RED
+# =========================
+
+seleccionar_interfaz() {
+    clear
+    echo "--- SELECCION DE INTERFAZ DE RED ---"
+    echo "INTERFACES DISPONIBLES:"
+    ip -o link show | awk -F': ' '{print $2}' | grep -v "lo"
+    
+    echo ""
+    read -p "NOMBRE DE LA INTERFAZ: " INTERFACE
+
+    if ! ip link show "$INTERFACE" > /dev/null 2>&1; then
+        echo "ERROR: LA INTERFAZ $INTERFACE NO EXISTE."
+        exit 1
+    fi
+    echo "TRABAJANDO SOBRE: $INTERFACE"
+    sleep 1
+}
+
+obtener_ip_actual() {
+    ip -4 addr show $INTERFACE 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1
+}
+
+activar_interfaces_red() {
+    echo ""
+    echo "--- ACTIVANDO INTERFACES DE RED ---"
+    
+    for iface in eth1 eth2; do
+        if ip link show $iface > /dev/null 2>&1; then
+            echo "ACTIVANDO $iface..."
+            ip link set $iface up
+            echo "  $iface ACTIVADA"
+        fi
+    done
+    
+    echo ""
+    echo "ESTADO ACTUAL DE INTERFACES:"
+    ip addr show | grep -E "^[0-9]+:" | sed 's/^/  /'
+}
+
+configurar_firewall_ping() {
+    echo "CONFIGURANDO FIREWALL PARA PERMITIR PING..."
+    if ! command -v iptables >/dev/null 2>&1; then
+        apt-get install -y iptables > /dev/null 2>&1
+    fi
+    iptables -A INPUT -i $INTERFACE -p icmp --icmp-type echo-request -j ACCEPT > /dev/null 2>&1
+    iptables -A OUTPUT -o $INTERFACE -p icmp --icmp-type echo-reply -j ACCEPT > /dev/null 2>&1
+    echo "REGLAS ICMP APLICADAS"
+}
+
+# =========================
+# FUNCIONES DE IP VIRTUAL
+# =========================
+
+crear_ip_virtual() {
+    local ip=$1
+    local interfaz=$2
+    
+    echo "--- VERIFICANDO IP VIRTUAL: $ip ---"
+    
+    if ip addr show $interfaz | grep -q "$ip"; then
+        echo "LA IP $ip YA ESTA CONFIGURADA EN $interfaz"
+        return 0
+    fi
+    
+    local ip_principal=$(obtener_ip_actual)
+    if [ "$ip" == "$ip_principal" ]; then
+        echo "ERROR: NO PUEDES USAR LA IP PRINCIPAL COMO VIRTUAL"
+        return 1
+    fi
+    
+    echo "CREANDO IP VIRTUAL: $ip EN $interfaz..."
+    
+    if ip addr add $ip/24 dev $interfaz; then
+        sleep 1
+        if ip addr show $interfaz | grep -q "$ip"; then
+            echo "IP VIRTUAL $ip CREADA EXITOSAMENTE"
+            
+            local config_file="/etc/network/interfaces"
+            
+            if ! grep -q "up ip addr add $ip/24 dev $interfaz" "$config_file" 2>/dev/null; then
+                echo "    up ip addr add $ip/24 dev $interfaz" >> "$config_file"
+                echo "    down ip addr del $ip/24 dev $interfaz" >> "$config_file"
+            fi
+            
+            IPS_VIRTUALES+=("$ip")
+            
+            echo ""
+            echo "ESTADO ACTUAL DE $interfaz:"
+            ip addr show $interfaz | grep "inet" | sed 's/^/  /'
+            
+            return 0
+        else
+            echo "ERROR: LA IP $ip NO APARECE DESPUES DE CREARLA"
+            return 1
+        fi
+    else
+        echo "ERROR AL EJECUTAR COMANDO IP ADDR ADD"
+        return 1
+    fi
+}
+
+eliminar_ip_virtual() {
+    local ip=$1
+    local interfaz=$2
+    
+    echo "--- ELIMINANDO IP VIRTUAL: $ip ---"
+    
+    if ip addr show $interfaz | grep -q "$ip"; then
+        echo "ELIMINANDO IP VIRTUAL: $ip DE $interfaz..."
+        
+        if ip addr del $ip/24 dev $interfaz; then
+            echo "IP VIRTUAL $ip ELIMINADA"
+            
+            sed -i "/up ip addr add $ip\/24 dev $interfaz/d" /etc/network/interfaces 2>/dev/null
+            sed -i "/down ip addr del $ip\/24 dev $interfaz/d" /etc/network/interfaces 2>/dev/null
+            
+            echo ""
+            echo "ESTADO ACTUAL DE $interfaz:"
+            ip addr show $interfaz | grep "inet" | sed 's/^/  /'
+            
+            return 0
+        else
+            echo "ERROR AL ELIMINAR IP VIRTUAL $ip"
+            return 1
+        fi
+    else
+        echo "LA IP $ip NO EXISTE EN $interfaz"
+        return 0
+    fi
+}
