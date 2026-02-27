@@ -1,0 +1,112 @@
+# ==============================================================================
+# FUNCIONES DHCP - Para Windows Server 2022
+# ==============================================================================
+
+# Cargar funciones comunes si no están disponibles
+if (-not (Get-Command "Write-Color" -ErrorAction SilentlyContinue)) {
+    . "$PSScriptRoot\funciones_compartidas.ps1"
+}
+
+function Verificar-InstalacionDHCP {
+    Write-Color "`n--- VERIFICANDO ROL DHCP (WINDOWS SERVER) ---" $CYAN
+    
+    $dhcpServer = Get-WindowsFeature -Name DHCP
+    
+    if ($dhcpServer.Installed) {
+        Write-Color "[OK] DHCP Server instalado" $GREEN
+        
+        $dhcpService = Get-Service -Name DHCPServer -ErrorAction SilentlyContinue
+        if ($dhcpService -and $dhcpService.Status -eq "Running") {
+            Write-Color "      ✓ Servicio DHCP activo" $GREEN
+        } else {
+            Write-Color "      ✗ Servicio DHCP inactivo" $RED
+        }
+    } else {
+        Write-Color "[X] DHCP Server NO instalado" $RED
+    }
+}
+
+function Instalar-DHCP {
+    Write-Color "Instalando servidor DHCP..." $YELLOW
+    
+    try {
+        Install-WindowsFeature -Name DHCP -IncludeManagementTools
+        
+        if ($?) {
+            Write-Color "✓ Instalación DHCP completada" $GREEN
+            
+            # Configurar servicio para inicio automático
+            Set-Service -Name DHCPServer -StartupType Automatic
+            Write-Color "✓ Servicio configurado para inicio automático" $GREEN
+            
+            # Autorizar DHCP en AD (si es necesario)
+            try {
+                Add-DhcpServerInDC -ErrorAction SilentlyContinue
+                Write-Color "✓ DHCP autorizado en dominio" $GREEN
+            } catch {}
+        }
+    } catch {
+        Write-Color "✗ Error en la instalación DHCP: $_" $RED
+    }
+}
+
+function Configurar-DHCP {
+    $SERVER_IP = Obtener-IPActual
+    if (-not $SERVER_IP) {
+        Write-Color "¡ALERTA! Configura una IP Estática primero." $RED
+        return
+    }
+    
+    Write-Color "`n--- CONFIGURAR SERVIDOR DHCP (WINDOWS SERVER) ---" $YELLOW
+    
+    $scopeName = Read-Host "Nombre del Ámbito DHCP (ej. Red_Windows)"
+    
+    do {
+        $ipIni = Read-Host "IP Inicial del rango"
+    } while (-not (Validar-IPCompleta $ipIni))
+    
+    do {
+        $ipFin = Read-Host "IP Final del rango"
+    } while (-not (Validar-IPCompleta $ipFin))
+    
+    $gateway = Read-Host "Gateway para clientes (Enter para omitir)"
+    if ($gateway -and -not (Validar-IPCompleta $gateway)) {
+        Write-Color "Gateway inválido, omitiendo..." $YELLOW
+        $gateway = ""
+    }
+    
+    do {
+        $leaseTime = Read-Host "Tiempo concesión (segundos) [Enter=86400]"
+        if ([string]::IsNullOrEmpty($leaseTime)) { $leaseTime = 86400; break }
+    } while ($leaseTime -notmatch '^\d+$' -or [int]$leaseTime -le 0)
+    
+    $subnet = ($SERVER_IP -split '\.')[0..2] -join '.' + ".0"
+    $broadcast = ($subnet -split '\.')[0..2] -join '.' + ".255"
+    
+    Write-Color "Generando configuración DHCP..." $CYAN
+    
+    try {
+        # Crear el ámbito DHCP
+        $scopeId = "$subnet"
+        Add-DhcpServerv4Scope -Name $scopeName -StartRange $ipIni -EndRange $ipFin -SubnetMask 255.255.255.0 -State Active
+        
+        # Configurar opciones del ámbito
+        Set-DhcpServerv4OptionValue -ScopeId $scopeId -OptionId 3 -Value $gateway  # Router
+        Set-DhcpServerv4OptionValue -ScopeId $scopeId -OptionId 6 -Value $SERVER_IP # DNS Server
+        Set-DhcpServerv4OptionValue -ScopeId $scopeId -OptionId 15 -Value "lab.local" # Domain Name
+        Set-DhcpServerv4OptionValue -ScopeId $scopeId -OptionId 44 -Value $SERVER_IP # WINS Server
+        Set-DhcpServerv4OptionValue -ScopeId $scopeId -OptionId 46 -Value 8 # WINS Node Type
+        
+        # Configurar tiempo de concesión
+        Set-DhcpServerv4Scope -ScopeId $scopeId -LeaseDuration (New-TimeSpan -Seconds $leaseTime)
+        
+        Write-Color ">>> SERVIDOR DHCP CONFIGURADO CORRECTAMENTE <<<" $GREEN
+        
+        # Mostrar resumen
+        Write-Color "`nResumen de configuración:" $CYAN
+        Get-DhcpServerv4Scope -ScopeId $scopeId | Format-List Name, ScopeId, SubnetMask, StartRange, EndRange, LeaseDuration
+    }
+    catch {
+        Write-Color "FALLO: Error al configurar DHCP: $_" $RED
+    }
+}
