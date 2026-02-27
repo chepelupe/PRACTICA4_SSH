@@ -1,0 +1,170 @@
+# ==============================================================================
+# FUNCIONES SSH - Para Windows Server 2022
+# ==============================================================================
+
+# Cargar funciones comunes si no están disponibles
+if (-not (Get-Command "Write-Color" -ErrorAction SilentlyContinue)) {
+    . "$PSScriptRoot\funciones_compartidas.ps1"
+}
+
+function Verificar-InstalacionSSH {
+    Write-Color "`n--- VERIFICANDO SERVICIO SSH (WINDOWS SERVER) ---" $CYAN
+    
+    $sshCapability = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Server*' }
+    
+    if ($sshCapability.State -eq 'Installed') {
+        Write-Color "[OK] OpenSSH Server instalado" $GREEN
+    } else {
+        Write-Color "[X] OpenSSH Server NO instalado" $RED
+    }
+    
+    $sshService = Get-Service -Name sshd -ErrorAction SilentlyContinue
+    if ($sshService) {
+        if ($sshService.Status -eq "Running") {
+            Write-Color "[OK] Servicio SSH activo" $GREEN
+        } else {
+            Write-Color "[X] Servicio SSH inactivo" $RED
+        }
+        
+        if ($sshService.StartType -eq "Automatic") {
+            Write-Color "[OK] SSH habilitado en el arranque" $GREEN
+        } else {
+            Write-Color "[X] SSH no está habilitado en el arranque" $RED
+        }
+    } else {
+        Write-Color "[X] Servicio SSH no encontrado" $RED
+    }
+    
+    # Verificar puerto 22
+    $portCheck = Get-NetTCPConnection -LocalPort 22 -ErrorAction SilentlyContinue
+    if ($portCheck) {
+        Write-Color "[OK] Puerto 22 escuchando" $GREEN
+    } else {
+        Write-Color "[X] Puerto 22 no está escuchando" $RED
+    }
+}
+
+function Instalar-SSHWindows {
+    Write-Color "`n--- INSTALANDO Y CONFIGURANDO SSH EN WINDOWS SERVER ---" $CYAN
+    Write-Color "¡IMPORTANTE! Después de esta instalación," $YELLOW
+    Write-Color "toda configuración posterior será vía SSH remota." $YELLOW
+    Write-Host ""
+    
+    $confirmar = Read-Host "¿Continuar con la instalación de SSH? (s/n)"
+    if ($confirmar -ne "s") {
+        Write-Color "Instalación cancelada." $YELLOW
+        return
+    }
+    
+    # Instalar OpenSSH Server
+    Write-Color "Instalando OpenSSH Server..." $CYAN
+    
+    try {
+        Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+        
+        if ($?) {
+            Write-Color "✓ Instalación SSH completada" $GREEN
+            
+            # Configurar servicio
+            Write-Color "Configurando servicio SSH..." $CYAN
+            Set-Service -Name sshd -StartupType 'Automatic'
+            Start-Service sshd
+            
+            # Configurar firewall
+            Write-Color "Configurando Firewall para SSH..." $CYAN
+            New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" `
+                                -DisplayName "OpenSSH Server (sshd)" `
+                                -Direction Inbound `
+                                -Protocol TCP `
+                                -LocalPort 22 `
+                                -Action Allow `
+                                -Enabled True `
+                                -ErrorAction SilentlyContinue
+            
+            Write-Color "✓ SSH instalado y configurado correctamente" $GREEN
+        }
+    }
+    catch {
+        Write-Color "✗ Error en la instalación SSH: $_" $RED
+        return
+    }
+    
+    # Obtener IP para conexión
+    $SERVER_IP = Obtener-IPActual
+    
+    Write-Color "`n═══════════════════════════════════════════════" $GREEN
+    Write-Color "✅ SSH CONFIGURADO CORRECTAMENTE EN WINDOWS" $GREEN
+    Write-Color "═══════════════════════════════════════════════" $GREEN
+    Write-Color "  IP del servidor: $SERVER_IP" $CYAN
+    Write-Color "  Puerto:          22" $CYAN
+    Write-Color "  Usuario:          $env:USERNAME" $CYAN
+    Write-Color "═══════════════════════════════════════════════" $GREEN
+    Write-Color "Para conectarte desde otro equipo:" $YELLOW
+    Write-Color "  ssh $env:USERNAME@$SERVER_IP" $WHITE
+}
+
+function Configurar-ParClaves {
+    Write-Color "`n--- CONFIGURACIÓN DE PAR DE CLAVES SSH ---" $CYAN
+    
+    $SERVER_IP = Obtener-IPActual
+    
+    Write-Color "Para mejorar la seguridad, puedes configurar autenticación por claves." $WHITE
+    Write-Host ""
+    Write-Color "En tu cliente Linux/Mac, ejecuta:" $YELLOW
+    Write-Host "  ssh-keygen -t ed25519"
+    Write-Host "  ssh-copy-id $env:USERNAME@$SERVER_IP"
+    Write-Host ""
+    Write-Color "En tu cliente Windows (PowerShell):" $YELLOW
+    Write-Host "  ssh-keygen -t ed25519"
+    Write-Host "  type `$env:USERPROFILE\.ssh\id_ed25519.pub | ssh $env:USERNAME@$SERVER_IP `"cat >> ~/.ssh/authorized_keys`""
+    
+    Read-Host "`nPresiona Enter para continuar..."
+}
+
+function Verificar-ConectividadSSH {
+    Write-Color "`n--- VERIFICANDO CONECTIVIDAD SSH LOCAL ---" $CYAN
+    
+    $sshService = Get-Service -Name sshd -ErrorAction SilentlyContinue
+    if ($sshService -and $sshService.Status -eq "Running") {
+        Write-Color "✓ Servicio SSH local está activo" $GREEN
+        
+        # Probar conexión local
+        Write-Color "Probando conexión a localhost..." $CYAN
+        $result = ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no localhost "echo 'Conexión SSH exitosa'" 2>&1
+        
+        if ($LASTEXITCODE -eq 0) {
+            Write-Color "✓ Conexión SSH a localhost exitosa" $GREEN
+        } else {
+            Write-Color "✗ No se pudo conectar a localhost" $RED
+        }
+    } else {
+        Write-Color "✗ Servicio SSH no está activo" $RED
+    }
+}
+
+function submenu_ssh {
+    while ($true) {
+        Clear-Host
+        Write-Color "`n========================================" $CYAN
+        Write-Color "   GESTIÓN DE SSH (ACCESO REMOTO)       " $CYAN
+        Write-Color "   Sistema: Windows Server 2022         " $CYAN
+        Write-Color "========================================" $CYAN
+        Write-Host "1) Verificar estado de SSH"
+        Write-Host "2) Instalar y configurar SSH en Windows"
+        Write-Host "3) Configurar autenticación por claves"
+        Write-Host "4) Verificar conectividad SSH local"
+        Write-Host "5) Volver al Menú Principal"
+        Write-Host "========================================"
+        
+        $subopc = Read-Host "`nSeleccione opción"
+        
+        switch ($subopc) {
+            "1" { Verificar-InstalacionSSH; Read-Host "Presiona Enter..." }
+            "2" { Instalar-SSHWindows; Read-Host "Presiona Enter..." }
+            "3" { Configurar-ParClaves }
+            "4" { Verificar-ConectividadSSH; Read-Host "Presiona Enter..." }
+            "5" { return }
+            default { Write-Color "Opción inválida" $RED; Start-Sleep -Seconds 1 }
+        }
+    }
+}

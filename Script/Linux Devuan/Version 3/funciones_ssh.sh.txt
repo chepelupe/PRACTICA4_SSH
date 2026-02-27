@@ -1,0 +1,133 @@
+#!/bin/bash
+# ==============================================================================
+# FUNCIONES SSH - VERSION SIMPLIFICADA (SYSVINIT)
+# ==============================================================================
+
+source ./funciones_compartidas.sh
+
+verificar_instalacion_ssh() {
+    echo ""
+    echo "--- VERIFICANDO SERVICIO SSH ---"
+    
+    if dpkg -s openssh-server >/dev/null 2>&1; then 
+        echo "[OK] OPENSSH SERVER INSTALADO"
+    else 
+        echo "[X] OPENSSH SERVER NO INSTALADO"
+        return 1
+    fi
+    
+    if service ssh status >/dev/null 2>&1; then
+        if service ssh status | grep -q "running"; then
+            echo "[OK] SERVICIO SSH ACTIVO"
+        else
+            echo "[X] SERVICIO SSH INACTIVO"
+        fi
+    else
+        echo "[X] SERVICIO SSH NO DISPONIBLE"
+    fi
+    
+    echo ""
+    echo "IPS DISPONIBLES PARA SSH:"
+    ip -4 addr show | grep inet | grep -v "127.0.0.1" | awk '{print "  " $2}'
+}
+
+activar_eth2() {
+    echo ""
+    echo "--- ACTIVANDO ETH2 ---"
+    
+    if ! ip link show eth2 > /dev/null 2>&1; then
+        echo "ERROR: ETH2 NO EXISTE"
+        return 1
+    fi
+    
+    echo "ACTIVANDO ETH2..."
+    ip link set eth2 up
+    sleep 2
+    
+    if ip link show eth2 | grep -q "UP"; then
+        echo "[OK] ETH2 ACTIVADA"
+    else
+        echo "[ERROR] NO SE PUDO ACTIVAR ETH2"
+        return 1
+    fi
+    
+    return 0
+}
+
+configurar_ssh_eth2() {
+    echo ""
+    echo "--- CONFIGURACION DE SSH EN ETH2 (HOST-ONLY) ---"
+    
+    if ! ip link show eth2 > /dev/null 2>&1; then
+        echo "ERROR: ETH2 NO EXISTE"
+        return 1
+    fi
+    
+    echo "ACTIVANDO ETH2..."
+    ip link set eth2 up
+    sleep 2
+    
+    echo "ASIGNANDO IP 192.168.56.10 A ETH2..."
+    ip addr flush dev eth2 2>/dev/null
+    ip addr add 192.168.56.10/24 dev eth2
+    
+    if ! grep -q "iface eth2" /etc/network/interfaces; then
+        cat >> /etc/network/interfaces <<EOF
+
+auto eth2
+iface eth2 inet static
+    address 192.168.56.10
+    netmask 255.255.255.0
+EOF
+        echo "CONFIGURACION PERMANENTE AGREGADA"
+    fi
+    
+    sed -i 's/^ListenAddress/#ListenAddress/g' /etc/ssh/sshd_config
+    if ! grep -q "^ListenAddress 0.0.0.0" /etc/ssh/sshd_config; then
+        echo "ListenAddress 0.0.0.0" >> /etc/ssh/sshd_config
+    fi
+    
+    echo "REINICIANDO SERVICIO SSH..."
+    service ssh restart
+    sleep 3
+    
+    if service ssh status | grep -q "running"; then
+        echo "[OK] SSH REINICIADO CORRECTAMENTE"
+    else
+        echo "[ERROR] SSH NO REINICIO"
+        tail -5 /var/log/syslog | grep ssh
+    fi
+    
+    echo ""
+    echo "================================================"
+    echo "SSH CONFIGURADO EN ETH2"
+    echo "IP: 192.168.56.10"
+    echo "================================================"
+    echo ""
+    echo "PRUEBA DESDE WINDOWS (POWERSHELL):"
+    echo "  ssh USUARIO@192.168.56.10"
+}
+
+submenu_ssh() {
+    while true; do
+        clear
+        echo ""
+        echo "========================================"
+        echo "   GESTION DE SSH                       "
+        echo "========================================"
+        echo "1) VERIFICAR ESTADO DE SSH"
+        echo "2) ACTIVAR ETH2 MANUALMENTE"
+        echo "3) CONFIGURAR SSH EN ETH2"
+        echo "4) VOLVER AL MENU PRINCIPAL"
+        echo "========================================"
+        
+        read -p "SELECCIONE OPCION: " subopc
+        case $subopc in
+            1) verificar_instalacion_ssh; read -p "PRESIONE ENTER PARA CONTINUAR..." ;;
+            2) activar_eth2; read -p "PRESIONE ENTER PARA CONTINUAR..." ;;
+            3) configurar_ssh_eth2; read -p "PRESIONE ENTER PARA CONTINUAR..." ;;
+            4) return ;;
+            *) echo "OPCION INVALIDA"; sleep 1 ;;
+        esac
+    done
+}
